@@ -7,10 +7,10 @@
     2. Crash-скрипты (CrashFallClient и т.п.) теперь отключаются мгновенно
        через DescendantAdded (а не раз в кадр), и включаются обратно
        при выключении анти-падения.
-    3. Хук ремоутов усилен: ловит и вызов через двоеточие
-       (remote:FireServer(...)), и вызов через точку
-       (remote.FireServer(remote, ...)), плюс RemoteFunction/InvokeServer
-       и новые ключевые слова (loop, wipeout).
+    3. Хук ремоутов усилен: ловит FireServer и InvokeServer,
+       ключевые слова без учёта регистра (crash, fall, bail, ragdoll,
+       loop, wipeout). Хук ставится ТОЛЬКО на __namecall — хук на __index
+       вызывает вылет Roblox, его нет и не нужно.
     4. Добавлен мгновенный подъём персонажа через Humanoid.StateChanged.
 ]]
 
@@ -41,28 +41,23 @@ local function isBlockedRemote(obj)
 end
 
 if hookmetamethod then
-	local oldNamecall
-	oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
-		if enabled and isBlockedRemote(self) then
-			local m = (typeof(getnamecallmethod) == "function") and getnamecallmethod()
-			if m == "FireServer" or m == "InvokeServer" then
-				return nil
+	-- ВАЖНО: хук только на __namecall. Хук на __index прогоняет через себя
+	-- ВСЕ обращения ко всем объектам в игре и вызывает вылет Roblox.
+	local ok, err = pcall(function()
+		local oldNamecall
+		oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+			if enabled and isBlockedRemote(self) then
+				local m = (typeof(getnamecallmethod) == "function") and getnamecallmethod()
+				if m == "FireServer" or m == "InvokeServer" then
+					return nil
+				end
 			end
-		end
-		return oldNamecall(self, ...)
+			return oldNamecall(self, ...)
+		end)
 	end)
-
-	-- Фолбэк: некоторые скрипты вызывают remote.FireServer(remote, ...) через
-	-- точку — такой вызов НЕ проходит через __namecall, поэтому ловим __index
-	local oldIndex
-	oldIndex = hookmetamethod(game, "__index", function(obj, key)
-		if enabled and (key == "FireServer" or key == "InvokeServer") and isBlockedRemote(obj) then
-			return function()
-				return nil
-			end
-		end
-		return oldIndex(obj, key)
-	end)
+	if not ok then
+		warn("[AntiFall] Хук __namecall не установился: " .. tostring(err))
+	end
 end
 
 -- =========================================================
@@ -163,6 +158,8 @@ if player.Character then
 end
 player.CharacterAdded:Connect(setupHumanoid)
 
+local lastStateSetup = nil
+
 RunService.Stepped:Connect(function()
 	if not enabled then return end
 
@@ -174,8 +171,12 @@ RunService.Stepped:Connect(function()
 	-- Запрещаем только Ragdoll и FallingDown.
 	-- PlatformStanding НЕ трогаем: игра использует его для езды на самокате,
 	-- его блокировка и была одной из причин падений.
-	humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
-	humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+	-- SetStateEnabled вызываем только один раз на гуманоида — не каждый кадр.
+	if lastStateSetup ~= humanoid then
+		lastStateSetup = humanoid
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+	end
 
 	local state = humanoid:GetState()
 	if state == Enum.HumanoidStateType.Ragdoll
