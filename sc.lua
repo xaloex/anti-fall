@@ -1,0 +1,290 @@
+--[[
+    ★ Anti-Looped Out ★ — исправленная версия
+
+    Что исправлено по сравнению со старой версией:
+    1. Убрана блокировка PlatformStanding — игра использует это состояние
+       для езды на самокате, и его блокировка САМА вызывала падение.
+    2. Crash-скрипты (CrashFallClient и т.п.) теперь отключаются мгновенно
+       через DescendantAdded (а не раз в кадр), и включаются обратно
+       при выключении анти-падения.
+    3. Хук ремоутов усилен: ловит FireServer и InvokeServer,
+       ключевые слова без учёта регистра (crash, fall, bail, ragdoll,
+       loop, wipeout). Хук ставится ТОЛЬКО на __namecall — хук на __index
+       вызывает вылет Roblox, его нет и не нужно.
+    4. Добавлен мгновенный подъём персонажа через Humanoid.StateChanged.
+]]
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+
+local player = Players.LocalPlayer
+local enabled = false
+
+-- =========================================================
+-- БЛОКИРОВКА CRASH-РЕМОУТОВ
+-- =========================================================
+local BLOCK_KEYWORDS = { "crash", "fall", "bail", "ragdoll", "loop", "wipeout" }
+
+local function isBlockedRemote(obj)
+	if typeof(obj) ~= "Instance" then return false end
+	if not (obj:IsA("RemoteEvent") or obj:IsA("RemoteFunction") or obj:IsA("UnreliableRemoteEvent")) then
+		return false
+	end
+	local n = obj.Name:lower()
+	for _, kw in ipairs(BLOCK_KEYWORDS) do
+		if n:find(kw, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+if hookmetamethod then
+	-- ВАЖНО: хук только на __namecall. Хук на __index прогоняет через себя
+	-- ВСЕ обращения ко всем объектам в игре и вызывает вылет Roblox.
+	local ok, err = pcall(function()
+		local oldNamecall
+		oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+			if enabled and isBlockedRemote(self) then
+				local m = (typeof(getnamecallmethod) == "function") and getnamecallmethod()
+				if m == "FireServer" or m == "InvokeServer" then
+					return nil
+				end
+			end
+			return oldNamecall(self, ...)
+		end)
+	end)
+	if not ok then
+		warn("[AntiFall] Хук __namecall не установился: " .. tostring(err))
+	end
+end
+
+-- =========================================================
+-- ОТКЛЮЧЕНИЕ КЛИЕНТСКИХ СКРИПТОВ АВАРИИ
+-- =========================================================
+local SCRIPT_KEYWORDS = { "crash", "fall", "ragdoll", "wipeout" }
+local originalDisabled = {} -- [script] = исходное состояние Disabled
+
+local function isCrashScript(inst)
+	if not (inst:IsA("LocalScript") or inst:IsA("Script")) then return false end
+	local n = inst.Name:lower()
+	for _, kw in ipairs(SCRIPT_KEYWORDS) do
+		if n:find(kw, 1, true) then
+			return true
+		end
+	end
+	return false
+end
+
+local function applyScriptBlocking()
+	local ps = player:FindFirstChild("PlayerScripts")
+	if not ps then return end
+	for _, d in ipairs(ps:GetDescendants()) do
+		if isCrashScript(d) then
+			if enabled then
+				if originalDisabled[d] == nil then
+					originalDisabled[d] = d.Disabled
+				end
+				d.Disabled = true
+			elseif originalDisabled[d] ~= nil then
+				d.Disabled = originalDisabled[d]
+				originalDisabled[d] = nil
+			end
+		end
+	end
+end
+
+local function hookPlayerScripts()
+	local ps = player:FindFirstChild("PlayerScripts")
+	if not ps then
+		-- PlayerScripts может ещё не существовать — ждём
+		task.spawn(function()
+			ps = player:WaitForChild("PlayerScripts", 30)
+			if ps then hookPlayerScripts() end
+		end)
+		return
+	end
+	ps.DescendantAdded:Connect(function(d)
+		if isCrashScript(d) then
+			task.defer(function()
+				if enabled and d.Parent then
+					originalDisabled[d] = false
+					d.Disabled = true
+				end
+			end)
+		end
+	end)
+	applyScriptBlocking()
+end
+hookPlayerScripts()
+
+-- =========================================================
+-- ЖЁСТКАЯ БЛОКИРОВКА СОСТОЯНИЙ ПАДЕНИЯ
+-- =========================================================
+local humanoidConnection = nil
+local currentHumanoid = nil
+
+local function cleanupHumanoid()
+	if humanoidConnection then
+		humanoidConnection:Disconnect()
+		humanoidConnection = nil
+	end
+	currentHumanoid = nil
+end
+
+local function setupHumanoid(character)
+	cleanupHumanoid()
+	local humanoid = character:WaitForChild("Humanoid", 15)
+	if not humanoid then return end
+	currentHumanoid = humanoid
+
+	humanoidConnection = humanoid.StateChanged:Connect(function(_, new)
+		if not enabled or currentHumanoid ~= humanoid then return end
+		if new == Enum.HumanoidStateType.Ragdoll
+			or new == Enum.HumanoidStateType.FallingDown then
+			-- мгновенно ставим персонажа обратно на ноги
+			task.defer(function()
+				if currentHumanoid == humanoid and humanoid.Parent then
+					humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+				end
+			end)
+		end
+	end)
+end
+
+if player.Character then
+	setupHumanoid(player.Character)
+end
+player.CharacterAdded:Connect(setupHumanoid)
+
+local lastStateSetup = nil
+
+RunService.Stepped:Connect(function()
+	if not enabled then return end
+
+	local character = player.Character
+	if not character then return end
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	if not humanoid then return end
+
+	-- Запрещаем только Ragdoll и FallingDown.
+	-- PlatformStanding НЕ трогаем: игра использует его для езды на самокате,
+	-- его блокировка и была одной из причин падений.
+	-- SetStateEnabled вызываем только один раз на гуманоида — не каждый кадр.
+	if lastStateSetup ~= humanoid then
+		lastStateSetup = humanoid
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.Ragdoll, false)
+		humanoid:SetStateEnabled(Enum.HumanoidStateType.FallingDown, false)
+	end
+
+	local state = humanoid:GetState()
+	if state == Enum.HumanoidStateType.Ragdoll
+		or state == Enum.HumanoidStateType.FallingDown then
+		humanoid:ChangeState(Enum.HumanoidStateType.GettingUp)
+	end
+end)
+
+-- =========================================================
+-- СОЗДАНИЕ ИНТЕРФЕЙСА (GUI)
+-- =========================================================
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "AntiFallGui"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = player:WaitForChild("PlayerGui")
+
+local frame = Instance.new("Frame")
+frame.Name = "MainFrame"
+frame.Size = UDim2.new(0, 190, 0, 85)
+frame.Position = UDim2.new(0.5, -95, 0.3, 0)
+frame.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+frame.BorderSizePixel = 0
+frame.Active = true
+frame.Parent = screenGui
+
+local corner = Instance.new("UICorner")
+corner.CornerRadius = UDim.new(0, 8)
+corner.Parent = frame
+
+local title = Instance.new("TextLabel")
+title.Size = UDim2.new(1, 0, 0, 30)
+title.BackgroundTransparency = 1
+title.Text = "★ Anti-Looped Out ★"
+title.TextColor3 = Color3.fromRGB(255, 255, 255)
+title.TextSize = 13
+title.Font = Enum.Font.SourceSansBold
+title.Parent = frame
+
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Size = UDim2.new(0.85, 0, 0, 35)
+toggleBtn.Position = UDim2.new(0.075, 0, 0.45, 0)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+toggleBtn.Text = "Анти-падение: ВЫКЛ"
+toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggleBtn.TextSize = 13
+toggleBtn.Font = Enum.Font.SourceSans
+toggleBtn.Parent = frame
+
+local btnCorner = Instance.new("UICorner")
+btnCorner.CornerRadius = UDim.new(0, 6)
+btnCorner.Parent = toggleBtn
+
+-- =========================================================
+-- ПЕРЕТАСКИВАНИЕ GUI
+-- =========================================================
+local dragging = false
+local dragInput = nil
+local dragStart = nil
+local startPos = nil
+
+local function update(input)
+	local delta = input.Position - dragStart
+	frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X,
+		startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+end
+
+frame.InputBegan:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1
+		or input.UserInputType == Enum.UserInputType.Touch then
+		dragging = true
+		dragStart = input.Position
+		startPos = frame.Position
+
+		input.Changed:Connect(function()
+			if input.UserInputState == Enum.UserInputState.End then
+				dragging = false
+			end
+		end)
+	end
+end)
+
+frame.InputChanged:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseMovement
+		or input.UserInputType == Enum.UserInputType.Touch then
+		dragInput = input
+	end
+end)
+
+UserInputService.InputChanged:Connect(function(input)
+	if input == dragInput and dragging then
+		update(input)
+	end
+end)
+
+-- =========================================================
+-- ВКЛЮЧЕНИЕ / ВЫКЛЮЧЕНИЕ
+-- =========================================================
+toggleBtn.MouseButton1Click:Connect(function()
+	enabled = not enabled
+	if enabled then
+		-- сразу гасим crash-скрипты, не ждём следующий кадр
+		applyScriptBlocking()
+		toggleBtn.Text = "Анти-падение: ВКЛ"
+		toggleBtn.BackgroundColor3 = Color3.fromRGB(50, 200, 80)
+	else
+		-- возвращаем скрипты в исходное состояние
+		applyScriptBlocking()
+		toggleBtn.Text = "Анти-падение: ВЫКЛ"
+		toggleBtn.BackgroundColor3 = Color3.fromRGB(200, 50, 50)
+	end
+end)
