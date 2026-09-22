@@ -9,10 +9,16 @@
        ScriptGrabber/<дата_сессии>/
            info.txt          — инфо о сессии и возможностях эксплойта
            dump_N/
-               script.txt      — ИСХОДНИК перехваченного скрипта
+               script.txt      — ИСХОДНИК перехваченного скрипта (как есть)
+               script_clean.txt— то же, но строки раскрыты (\xNN \ddd \u{} \z)
                functions.txt   — дамп всех функций (прото, константы, upvalue)
                decompiled.txt  — попытка декомпиляции байткода Luau VM
            http_N_*.lua      — ответы HttpGet (исходники, скачанные скриптом)
+
+    СТЕЛС: хуки одноразовые (ONE_SHOT_CAPTURE) — после первого перехвата
+    loadstring/HttpGet мгновенно восстанавливаются в оригинал, чтобы
+    анти-тампер скрипта не заметил подмену и не кикнул. Если всё равно
+    кикает — поставь HOOK_HTTPGET = false и лови только через loadstring.
 
     Декомпиляция байткода работает только если в эксплойте есть функция
     decompile() (Synapse и т.п.). Если её нет — сохраняется исходный source.
@@ -28,6 +34,11 @@ if genv.__SCRIPT_GRABBER_ACTIVE then
 	return
 end
 genv.__SCRIPT_GRABBER_ACTIVE = true
+
+--// Настройки стелса ──────────────────────────────────────────────────────
+local ONE_SHOT_CAPTURE = true   -- снять все хуки сразу после 1-го перехвата (защита от анти-тампера)
+local HOOK_LOADSTRING  = true   -- перехват loadstring (главный источник дампа)
+local HOOK_HTTPGET     = true   -- перехват game:HttpGet / HttpGetAsync / request
 
 --// Проверка окружения эксплойта ──────────────────────────────────────────
 local HAS_FS = (typeof(writefile) == "function")
@@ -80,12 +91,97 @@ local function urlToName(url)
 	return tostring(url):gsub("[^%w]", "_"):sub(1, 48)
 end
 
+--// Раскрытие escape-строк внутри литералов исходника ─────────────────────
+-- Обфускаторы прячут текст в \xNN, \ddd, \u{...}, \z — без этого в дампе
+-- каша. Меняется содержимое ТОЛЬКО строковых литералов, код не трогаем.
+local function decodeEscapes(body)
+	if not body:find("\\", 1, true) then return nil end -- эскейпов нет — не трогаем
+	local s = body:gsub("\\z%s+", "")
+	s = s:gsub("\\u%{(%x+)%}", function(hex)
+		local ok, ch = pcall(utf8.char, tonumber(hex, 16) or 0xFFFD)
+		return (ok and ch) or "?"
+	end)
+	s = s:gsub("\\x(%x%x)", function(h)
+		return string.char(tonumber(h, 16) or 63)
+	end)
+	s = s:gsub("\\(%d%d?%d?)", function(d)
+		local num = tonumber(d)
+		return (num and num < 256) and string.char(num) or d
+	end)
+	-- если после раскрытия появились кавычки/переводы строк — литерал сломается,
+	-- оставляем как было
+	if s:find("[\"'\r\n]") then return nil end
+	return s
+end
+
+local function unescapeSource(src)
+	if type(src) ~= "string" or #src == 0 then return src end
+	local out = {}
+	local i, n = 1, #src
+	local segStart = i
+	local function copy(from, to)
+		out[#out + 1] = src:sub(from, to)
+	end
+	while i <= n do
+		local b = src:byte(i)
+		if b == 34 or b == 39 or (b == 45 and src:byte(i + 1) == 45) then -- " или ' или --
+			if segStart <= i - 1 then copy(segStart, i - 1) end
+			if b == 45 then
+				-- однострочный комментарий — копируем как есть
+				local nl = string.find(src, "\n", i, true)
+				if nl then
+					copy(i, nl - 1)
+					out[#out + 1] = "\n"
+					i = nl + 1
+				else
+					copy(i, n)
+					i = n + 1
+				end
+			else
+				-- строковый литерал: сканируем до закрытия
+				local quote, j, closed = b, i + 1, false
+				local buf = {}
+				while j <= n do
+					local cb = src:byte(j)
+					if cb == 92 then -- backslash
+						buf[#buf + 1] = src:sub(j, math.min(j + 1, n))
+						j = j + 2
+					elseif cb == quote then
+						closed = true
+						break
+					elseif cb == 10 then -- строка не закрыта
+						break
+					else
+						buf[#buf + 1] = src:sub(j, j)
+						j = j + 1
+					end
+				end
+				local raw = table.concat(buf)
+				if closed then
+					local decoded = decodeEscapes(raw)
+					out[#out + 1] = string.char(quote) .. (decoded or raw) .. string.char(quote)
+					i = j + 1
+				else
+					copy(i, n)
+					i = n + 1
+				end
+			end
+			segStart = i
+		else
+			i = i + 1
+		end
+	end
+	if segStart <= n then copy(segStart, n) end
+	return table.concat(out)
+end
+
 ensureDir(ROOT)
 ensureDir(SESSION)
 saveFile(SESSION .. "/info.txt", table.concat({
 	"ScriptGrabber — сессия: " .. sessionName,
 	"Эксплойт: " .. tostring((typeof(identifyexecutor) == "function") and identifyexecutor() or "неизвестно"),
 	"Файловая система: " .. tostring(HAS_FS),
+	"Стелс (ONE_SHOT_CAPTURE): " .. tostring(ONE_SHOT_CAPTURE),
 	"decompile (декомпиляция байткода): " .. tostring(decompile_fn ~= nil),
 	"getconstants: " .. tostring(getconstants ~= nil)
 		.. " | getupvalues: " .. tostring(getupvalues ~= nil)
@@ -94,7 +190,7 @@ saveFile(SESSION .. "/info.txt", table.concat({
 }, "\n"))
 
 --// Дамп функций (прото-дерево + константы + upvalue) ─────────────────────
-local MAX_LINES = 4000
+local MAX_LINES = 12000
 local dumpLines = {}
 
 local function addLine(s)
@@ -152,10 +248,14 @@ local function dumpClosure(fn, name, depth)
 		local ok, consts = pcall(getconstants, fn)
 		if ok and type(consts) == "table" and #consts > 0 then
 			local parts = {}
-			for _, c in ipairs(consts) do
+			for i, c in ipairs(consts) do
+				if i > 150 then
+					parts[#parts + 1] = ("… (ещё %d констант — читаемые строки ищи в script_clean.txt)"):format(#consts - 150)
+					break
+				end
 				parts[#parts + 1] = prettyValue(c)
 			end
-			addLine(pad .. "    константы: " .. table.concat(parts, ", "))
+			addLine(pad .. "    константы (" .. #consts .. "): " .. table.concat(parts, ", "))
 		end
 	end
 
@@ -186,6 +286,11 @@ local function saveDump(chunkName, source, fn, errText)
 		tostring(source or "(исходник недоступен)"),
 	}, "\n"))
 
+	-- 1b) Версия с раскрытыми строками (\xNN, \ddd, \u{}, \z)
+	if type(source) == "string" then
+		saveFile(folder .. "/script_clean.txt", unescapeSource(source))
+	end
+
 	-- 2) Дамп функций → functions.txt
 	dumpLines = { "=== Дамп функций: " .. tostring(chunkName or "loadstring") .. " ===" }
 	if errText then
@@ -207,7 +312,7 @@ local function saveDump(chunkName, source, fn, errText)
 	else
 		saveFile(folder .. "/decompiled.txt", table.concat({
 			"-- В этом эксплойте нет функции decompile() — декомпилировать байткод нечем.",
-			"-- Если исходник передавался напрямую в loadstring, он уже в script.txt.",
+			"-- Если исходник передавался напрямую в loadstring, он уже в script.txt / script_clean.txt.",
 			"-- Исходник, скачанный через HttpGet, лежит рядом в http_N_*.lua",
 		}, "\n"))
 	end
@@ -250,17 +355,25 @@ end
 
 --// Хук на loadstring ──────────────────────────────────────────────────────
 local function installLoadstringHook()
+	if not HOOK_LOADSTRING then return end
 	local original = genv.loadstring
 	if typeof(original) ~= "function" then
 		warn("[ScriptGrabber] loadstring не найден — основной хук не работает")
 		return
 	end
 
+	local unhooked = false
 	local wrapped = function(src, chunkname)
 		local results = table.pack(original(src, chunkname))
 		local fn = (typeof(results[1]) == "function") and results[1] or nil
 		local err = (fn == nil and results.n >= 2) and tostring(results[2]) or nil
 		task.spawn(saveDump, chunkname, src, fn, err)
+		-- Стелс: сразу возвращаем оригинал — анти-тампер не увидит подмену
+		if ONE_SHOT_CAPTURE and not unhooked then
+			unhooked = true
+			pcall(function() genv.loadstring = original end)
+			print("[ScriptGrabber] Хук loadstring снят (стелс-режим), оригинал восстановлен")
+		end
 		return table.unpack(results, 1, results.n)
 	end
 
@@ -274,10 +387,13 @@ end
 
 --// Хук на game:HttpGet / HttpGetAsync ─────────────────────────────────────
 local function installHttpGetHook()
+	if not HOOK_HTTPGET then return end
 	if typeof(hookmetamethod) ~= "function" then
 		warn("[ScriptGrabber] hookmetamethod недоступен — HttpGet не логируется")
 		return
 	end
+
+	local restored = false
 	local ok = pcall(function()
 		local old
 		old = hookmetamethod(game, "__namecall", function(self, ...)
@@ -293,6 +409,12 @@ local function installHttpGetHook()
 						saveFile(path, "-- URL: " .. url .. "\n\n" .. results[1])
 						print("[ScriptGrabber] HttpGet сохранён → " .. path)
 					end)
+				end
+				-- Стелс: снимаем хук после первого перехвата
+				if ONE_SHOT_CAPTURE and not restored then
+					restored = true
+					pcall(function() hookmetamethod(game, "__namecall", old) end)
+					print("[ScriptGrabber] Хук __namecall снят (стелс-режим)")
 				end
 				return table.unpack(results, 1, results.n)
 			end
@@ -320,6 +442,10 @@ local function installRequestHook()
 							local path = SESSION .. "/http_" .. httpCount .. "_" .. urlToName(opts.Url) .. ".lua"
 							saveFile(path, "-- URL: " .. opts.Url .. " (через " .. name .. ")\n\n" .. results[1].Body)
 						end)
+					end
+					-- Стелс: снимаем подмену после первого перехвата
+					if ONE_SHOT_CAPTURE then
+						pcall(function() genv[name] = original end)
 					end
 					return table.unpack(results, 1, results.n)
 				end
