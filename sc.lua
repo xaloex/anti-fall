@@ -65,11 +65,14 @@
     СЛОИ (каждый кнопкой):
       [1] Скрипты аварии  — выключить и держать выключенными
                             (по умолчанию только CrashFallClient — точно).
-      [2] Ремоуты аварии  — уничтожить локально (по умолчанию только
-                            CrashRootCommit). Широкий режим по словам
-                            (cfg.scriptMode/remoteMode = "keywords") может
-                            задеть UI игры и вызвать "attempt to call a nil value" —
-                            включать только если точные цели не помогают.
+      [2] Ремоуты аварии  — уничтожить локально. ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНО:
+                            Destroy() на ремоуте ломает игровой код, который
+                            ждёт его через WaitForChild — тот получает nil и
+                            падает с "attempt to call a nil value".
+                            Включать только если без него не работает.
+      [11] Ошибки игры     — пишутся в лог с пометкой "ИГРА ОШИБКА",
+                            "(давняя)" = было ещё до нашего запуска (игра),
+                            без пометки = появилось при нас (наш скрипт).
       [3] Не падать       — запрет Ragdoll/FallingDown, мгновенный подъём.
       [4] Держать деку    — возвращать в позу "стоя на деке" после срыва,
                             пока игра снова не посадит. Клавиша C — отпустить.
@@ -90,7 +93,11 @@ local player = Players.LocalPlayer
 local cfg = {
 	enabled      = true,   -- главный тумблер
 	blockScripts = true,   -- [1]
-	blockRemotes = true,   -- [2]
+	-- [2] ВНИМАНИЕ: Destroy() на ремоуте ломает игровой код, который ждёт его
+	-- через WaitForChild: ожидание вернёт nil и игра упадёт с
+	-- "attempt to call a nil value". Поэтому по умолчанию ВЫКЛЮЧЕНО.
+	-- Включай, только если без этого не работает, и помни про эту ошибку.
+	blockRemotes = false,  -- [2]
 	noFall       = true,   -- [3]
 	holdDeck     = true,   -- [4]
 	assist       = true,   -- [5]
@@ -154,6 +161,39 @@ local function remoteIsCrash(name)
 	end
 	return listHasExact(cfg.crashRemotes, name)
 end
+
+-- =========================================================
+-- [11] ПЕРЕХВАТ ОШИБОК ИГРЫ
+--   Видно сразу, наша это ошибка или игра сама так падает:
+--   * "(давняя)" — ошибка была ДО запуска нашего скрипта, значит игра;
+--   * без пометки — появилась уже при нас, значит что-то задел наш скрипт.
+-- =========================================================
+local gameErrors = { count = 0, last = "-", history = {} }
+
+local function noteGameError(text, wasBefore)
+	gameErrors.count += 1
+	local line = (wasBefore and "(давняя) " or "") .. tostring(text)
+	gameErrors.last = string.sub(line, 1, 120)
+	table.insert(gameErrors.history, line)
+	if #gameErrors.history > 60 then
+		table.remove(gameErrors.history, 1)
+	end
+	log("ИГРА ОШИБКА", line)
+end
+
+pcall(function()
+	local LogService = game:GetService("LogService")
+	for _, e in ipairs(LogService:GetLogHistory()) do
+		if e.messageType == Enum.MessageType.MessageError then
+			noteGameError(e.message, true)
+		end
+	end
+	LogService.MessageOut:Connect(function(message, msgType)
+		if msgType == Enum.MessageType.MessageError then
+			noteGameError(message, false)
+		end
+	end)
+end)
 
 -- ================= СОСТОЯНИЕ =================
 local humanoid, root, character
@@ -918,7 +958,7 @@ screenGui.Parent = player:WaitForChild("PlayerGui")
 
 local frame = Instance.new("Frame")
 frame.Name = "MainFrame"
-frame.Size = UDim2.new(0, 270, 0, 356)
+frame.Size = UDim2.new(0, 270, 0, 400)
 frame.Position = UDim2.new(0, 20, 0, 90)
 frame.BackgroundColor3 = Color3.fromRGB(26, 26, 30)
 frame.BorderSizePixel = 0
@@ -964,8 +1004,8 @@ local farmBtn   = makeButton("АВТО-ФАРМ ВИЛИ: ВЫКЛ", 234, red)
 local calibBtn  = makeButton("Найти клавишу вили", 260, Color3.fromRGB(60, 90, 150))
 
 local info = Instance.new("TextLabel")
-info.Size = UDim2.new(1, -8, 0, 78)
-info.Position = UDim2.new(0, 4, 1, -82)
+info.Size = UDim2.new(1, -8, 0, 104)
+info.Position = UDim2.new(0, 4, 1, -110)
 info.BackgroundTransparency = 1
 info.TextColor3 = Color3.fromRGB(220, 225, 220)
 info.TextSize = 11
@@ -992,12 +1032,13 @@ local function refreshInfo()
 		end
 	end
 	info.Text = string.format(
-		"на деке: %s | угол: %.0f° | %.0f студ/с\nдержу: %s | срывов: %d | ассист: %d\nфарм: %s | вили: %s (%s) | +%s$\nдека: %s | %s\n%s",
+		"на деке: %s | угол: %.0f° | %.0f студ/с\nдержу: %s | срывов: %d | ассист: %d\nфарм: %s | вили: %s (%s) | +%s$\nдека: %s | %s\n%s\nошибок игры: %d | %s",
 		tostring(isMounted()), angle, speed,
 		tostring(holdActive), crashCount, assistClamps,
 		tostring(farm.on), farm.wheelieName, tostring(farm.method), tostring(farm.earned),
 		deckRel and "записана" or "НЕТ", lastAngle,
-		lastCrash)
+		lastCrash,
+		gameErrors.count, gameErrors.last)
 end
 
 masterBtn.MouseButton1Click:Connect(function()
