@@ -63,8 +63,13 @@
         Running -> FallingDown. То есть тебя ПЕРЕСТАЮТ держать на деке.
 
     СЛОИ (каждый кнопкой):
-      [1] Скрипты аварии  — выключить и держать выключенными.
-      [2] Ремоуты аварии  — уничтожить локально (CrashRootCommit и подобные).
+      [1] Скрипты аварии  — выключить и держать выключенными
+                            (по умолчанию только CrashFallClient — точно).
+      [2] Ремоуты аварии  — уничтожить локально (по умолчанию только
+                            CrashRootCommit). Широкий режим по словам
+                            (cfg.scriptMode/remoteMode = "keywords") может
+                            задеть UI игры и вызвать "attempt to call a nil value" —
+                            включать только если точные цели не помогают.
       [3] Не падать       — запрет Ragdoll/FallingDown, мгновенный подъём.
       [4] Держать деку    — возвращать в позу "стоя на деке" после срыва,
                             пока игра снова не посадит. Клавиша C — отпустить.
@@ -101,6 +106,15 @@ local cfg = {
 
 local KEYWORDS = { "crash", "fall", "wipeout", "bail", "ragdoll", "looped" }
 
+-- ВАЖНО: по умолчанию трогаем ТОЛЬКО точные цели.
+-- Широкий режим по словам опасен: под "fall"/"bail"/"crash" может попасть
+-- UI-скрипт или ремоут интерфейса, и игра потом падает с
+-- "attempt to call a nil value". Нужен широкий — поставь "keywords".
+cfg.scriptMode   = "exact"
+cfg.remoteMode   = "exact"
+cfg.crashScripts = { "CrashFallClient" }
+cfg.crashRemotes = { "CrashRootCommit" }
+
 local function log(...)
 	if cfg.debug then
 		print("[ANTI-FALL]", ...)
@@ -115,6 +129,30 @@ local function nameHasKeyword(name)
 		end
 	end
 	return false
+end
+
+local function listHasExact(list, name)
+	local low = string.lower(tostring(name))
+	for _, n in ipairs(list) do
+		if string.lower(tostring(n)) == low then
+			return true
+		end
+	end
+	return false
+end
+
+local function scriptIsCrash(name)
+	if cfg.scriptMode == "keywords" then
+		return nameHasKeyword(name)
+	end
+	return listHasExact(cfg.crashScripts, name)
+end
+
+local function remoteIsCrash(name)
+	if cfg.remoteMode == "keywords" then
+		return nameHasKeyword(name)
+	end
+	return listHasExact(cfg.crashRemotes, name)
 end
 
 -- ================= СОСТОЯНИЕ =================
@@ -199,7 +237,7 @@ local function blockCrashScripts(silent)
 	if not ps then return 0 end
 	local count = 0
 	for _, d in ipairs(ps:GetDescendants()) do
-		if d:IsA("LocalScript") and not d.Disabled and nameHasKeyword(d.Name) then
+		if d:IsA("LocalScript") and not d.Disabled and scriptIsCrash(d.Name) then
 			blockedScripts[d] = true
 			local full = d:GetFullName()
 			if pcall(function() d.Disabled = true end) then
@@ -229,7 +267,7 @@ local function blockCrashRemotes()
 	local count = 0
 	for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
 		if (d:IsA("RemoteEvent") or d:IsA("RemoteFunction") or d:IsA("UnreliableRemoteEvent"))
-			and nameHasKeyword(d.Name) then
+			and remoteIsCrash(d.Name) then
 			local full = d:GetFullName()
 			if pcall(function() d:Destroy() end) then
 				count += 1
@@ -243,7 +281,7 @@ end
 local function watchRemotes()
 	if not scooterRemotes then return end
 	scooterRemotes.DescendantAdded:Connect(function(d)
-		if cfg.enabled and cfg.blockRemotes and nameHasKeyword(d.Name) then
+		if cfg.enabled and cfg.blockRemotes and remoteIsCrash(d.Name) then
 			task.defer(function()
 				log("появился ремоут аварии -> уничтожаю:", d:GetFullName())
 				pcall(function() d:Destroy() end)
