@@ -1,5 +1,16 @@
 --[[
-    ★ Anti-Looped Out v8: анти-падение + авто-фарм + свои самокаты ★
+    ★ Anti-Looped Out v9: анти-падение + фарм + свои самокаты + серверный спавн ★
+
+    СЕРВЕРНЫЙ СПАВН (чтобы видели ВСЕ игроки):
+      Локальный клон видят только ты — это ограничение Roblox, обойти нельзя.
+      Чтобы самокат создал сервер, есть две кнопки в окне САМИКИ:
+        1. "Лог ремоутов 20 сек" — __namecall-хук на 20 секунд: пишет все
+           FireServer/InvokeServer. Сделай в это время обычное действие
+           с самокатом — увидим точные аргументы спавна.
+           Если твой исполнитель крашится от хуков — не жми, пользуйся второй.
+        2. "Проба SpawnScooter" — совсем без хуков: дёргает игровой ремоут
+           спавна с разными аргументами и смотрит, появился ли самокат.
+           Покупки (purchase/buy) не трогаются никогда.
 
     ОКНО "САМИКИ" (справа):
       * список моделей из ReplicatedStorage.Scooters — что нашлось, то в списке;
@@ -880,7 +891,7 @@ Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
 local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, 0, 0, 24)
 title.BackgroundTransparency = 1
-title.Text = "★ Anti-Looped Out v8 ★"
+title.Text = "★ Anti-Looped Out v9 ★"
 title.TextColor3 = Color3.fromRGB(255, 255, 255)
 title.TextSize = 13
 title.Font = Enum.Font.SourceSansBold
@@ -1484,3 +1495,416 @@ makeDraggable(f2)
 refreshTemplates()
 buildList()
 log("окно САМИКИ готово. Выбери модель -> Спавнить рядом -> Сесть на мой, газ W.")
+
+-- =========================================================
+-- [9] СЕРВЕРНЫЙ СПАВН — чтобы самокат видели ВСЕ
+--
+--     Другие игроки видят только то, что создал СЕРВЕР. Локальный клон
+--     (кнопка "Спавнить рядом") не увидит никто, кроме тебя — это факт,
+--     его обойти нельзя. Значит надо вызвать игровой ремоут спавна
+--     (SpawnScooter) — тогда сервер создаст настоящий самокат.
+--
+--     Две кнопки:
+--       * "Лог ремоутов 20с" — ставит __namecall-хук на 20 секунд и пишет
+--         все FireServer/InvokeServer. Сделай за это время в игре обычное
+--         действие с самокатом (выбери/получи/сядь) — мы увидим ТОЧНЫЕ
+--         аргументы, и я прикручу честный вызов. Хук безопасный: срабатывает
+--         только на заранее собранном списке ремоутов и сам замолкает через
+--         20 сек. Если исполнитель крашится от хуков — не жми эту кнопку.
+--       * "Проба SpawnScooter" — без хуков вообще: дёргает ремоут спавна
+--         с несколькими наборами аргументов и смотрит, появился ли самокат.
+--         Ремоуты с purchase/buy в имени не трогаются никогда.
+-- =========================================================
+f2.Size = UDim2.new(0, 260, 0, 505)
+
+local srvStatus = Instance.new("TextLabel")
+srvStatus.Size = UDim2.new(0.95, 0, 0, 58)
+srvStatus.Position = UDim2.new(0.025, 0, 0, 440)
+srvStatus.BackgroundTransparency = 1
+srvStatus.TextColor3 = Color3.fromRGB(200, 215, 225)
+srvStatus.TextSize = 11
+srvStatus.Font = Enum.Font.Code
+srvStatus.TextXAlignment = Enum.TextXAlignment.Left
+srvStatus.TextYAlignment = Enum.TextYAlignment.Top
+srvStatus.TextWrapped = true
+srvStatus.Text = "серверный спавн: жду"
+srvStatus.Parent = f2
+
+local btnSummon = makeBtn2("Призвать самокат ко мне", 306, Color3.fromRGB(60, 150, 140))
+local btnReplay = makeBtn2("Повторить вызов серверу", 332, Color3.fromRGB(110, 130, 60))
+local btnCap    = makeBtn2("Лог ремоутов 20 сек", 358, Color3.fromRGB(120, 80, 170))
+local btnProbe  = makeBtn2("Проба SpawnScooter", 384, Color3.fromRGB(150, 110, 60))
+local btnStopP  = makeBtn2("Стоп пробы", 410, Color3.fromRGB(140, 60, 60))
+
+local function argsToStr(...)
+	local n = select("#", ...)
+	local parts = {}
+	for i = 1, math.min(n, 4) do
+		local v = select(i, ...)
+		if typeof(v) == "Instance" then
+			parts[#parts + 1] = v.ClassName .. ":" .. v.Name
+		else
+			parts[#parts + 1] = tostring(v)
+		end
+	end
+	if n > 4 then
+		parts[#parts + 1] = "..."
+	end
+	return "(" .. table.concat(parts, ", ") .. ")"
+end
+
+-- набор ремоутов для супер-быстрой проверки в хуке
+local remoteSet = setmetatable({}, { __mode = "k" })
+local function addRemotes(container)
+	if not container then return end
+	for _, d in ipairs(container:GetDescendants()) do
+		if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+			remoteSet[d] = true
+		end
+	end
+end
+addRemotes(ReplicatedStorage)
+ReplicatedStorage.DescendantAdded:Connect(function(d)
+	if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+		remoteSet[d] = true
+	end
+end)
+
+local capture = { active = false, logging = false, calls = 0 }
+local lastCall = nil   -- последний вызов ремоута самоката: {remote = ..., args = table.pack(...)}
+
+local function isScooterRemote(name)
+	local n = string.lower(tostring(name))
+	return string.find(n, "scooter", 1, true) ~= nil
+		or string.find(n, "spawn", 1, true) ~= nil
+		or string.find(n, "mount", 1, true) ~= nil
+		or string.find(n, "equip", 1, true) ~= nil
+		or string.find(n, "wheelie", 1, true) ~= nil
+end
+
+local function startCapture(seconds)
+	if capture.active then
+		log("лог ремоутов уже идёт")
+		return
+	end
+	local hf = gget("hookfunction")
+	if type(hf) ~= "function" then
+		log("нет hookfunction — в этом исполнителе лог ремоутов недоступен, жми Пробу")
+		srvStatus.Text = "серверный спавн: хуки недоступны"
+		return
+	end
+
+	local gnm = gget("getnamecallmethod")
+	local orig
+
+	local function hookFn(self, ...)
+		if capture.logging and remoteSet[self] then
+			local method = "?"
+			pcall(function()
+				if type(gnm) == "function" then
+					method = gnm()
+				end
+			end)
+			local full = "?"
+			pcall(function() full = self:GetFullName() end)
+			capture.calls += 1
+			log("КЛИЕНТ>СЕРВЕР", full .. ":" .. tostring(method) .. argsToStr(...))
+			-- запоминаем вызов на будущее: его можно будет повторить
+			if isScooterRemote(self.Name) then
+				local okPack, packed = pcall(function() return table.pack(...) end)
+				if okPack and packed then
+					lastCall = { remote = self, args = packed }
+				end
+			end
+		end
+		return orig(self, ...)
+	end
+
+	local getrmt = gget("getrawmetatable")
+	local mt
+	if type(getrmt) == "function" then
+		local ok, m = pcall(getrmt, game)
+		if ok then mt = m end
+	end
+
+	if mt and type(mt.__namecall) == "function" then
+		local ok, res = pcall(hf, mt.__namecall, hookFn)
+		if not ok then
+			log("hookfunction не сработал: " .. tostring(res))
+			srvStatus.Text = "серверный спавн: хук не встал"
+			return
+		end
+		orig = res
+	else
+		local hmm = gget("hookmetamethod")
+		if type(hmm) ~= "function" then
+			log("нет hookmetamethod — лог ремоутов недоступен")
+			srvStatus.Text = "серверный спавн: хуки недоступны"
+			return
+		end
+		local ok, res = pcall(hmm, game, "__namecall", hookFn)
+		if not ok then
+			log("hookmetamethod не сработал: " .. tostring(res))
+			srvStatus.Text = "серверный спавн: хук не встал"
+			return
+		end
+		orig = res
+	end
+
+	capture.active = true
+	capture.logging = true
+	capture.calls = 0
+	srvStatus.Text = "серверный спавн: пишу 20 сек, делай действие в игре"
+	log("лог ремоутов ВКЛ на " .. seconds .. " сек")
+	log("сделай в игре обычное действие: выбери самокат / получи его / сядь — а я увижу точный вызов")
+
+	task.delay(seconds, function()
+		capture.logging = false
+		capture.active = false
+		srvStatus.Text = "серверный спавн: записано " .. capture.calls .. " вызовов"
+		log("лог ремоутов выключен (записано вызовов: " .. capture.calls .. ")")
+		-- пробуем вернуть хук как было; если не выйдет — он прозрачный, ничего не делает
+		if orig then
+			local ok, err = pcall(hf, hookFn, orig)
+			log(ok and "хук снят, вернул как было" or ("хук оставлен (прозрачный): " .. tostring(err)))
+		end
+	end)
+end
+
+local probe = { running = false, stopFlag = false }
+
+local function remotesLike(pattern)
+	local res = {}
+	for _, d in ipairs(ReplicatedStorage:GetDescendants()) do
+		if (d:IsA("RemoteEvent") or d:IsA("RemoteFunction"))
+			and string.find(string.lower(d.Name), pattern, 1, true) then
+			res[#res + 1] = d
+		end
+	end
+	return res
+end
+
+local function workspaceModelCount()
+	local n = 0
+	for _, o in ipairs(workspace:GetChildren()) do
+		if o:IsA("Model") then n += 1 end
+	end
+	return n
+end
+
+local function probeSpawn()
+	if probe.running then
+		log("проба уже идёт")
+		return
+	end
+	local targets = remotesLike("spawnscooter")
+	if #targets == 0 then targets = remotesLike("spawn") end
+	if #targets == 0 then
+		log("проба: ремоут спавна не найден")
+		srvStatus.Text = "серверный спавн: ремоут не найден"
+		return
+	end
+
+	probe.running = true
+	probe.stopFlag = false
+	log("проба: ремоутов-целей " .. #targets .. ", покупки не трогаю")
+
+	task.spawn(function()
+		for _, r in ipairs(targets) do
+			if probe.stopFlag then break end
+			local low = string.lower(r.Name)
+			if string.find(low, "purchase", 1, true) or string.find(low, "buy", 1, true) then
+				log("проба: пропускаю " .. r.Name .. " (покупка — не рискуем деньгами)")
+			else
+				local trials = {
+					{ "()", nil },
+					{ "(true)", true },
+					{ "(имя выбранной модели)", my.selected and my.selected.Name or "Scooter" },
+					{ "(инстанс модели)", my.selected },
+					{ "(игрок)", player },
+					{ "(игрок, имя)", player, my.selected and my.selected.Name or "Scooter" },
+				}
+				local isFunc = false
+				pcall(function() isFunc = r:IsA("RemoteFunction") end)
+				for _, t in ipairs(trials) do
+					if probe.stopFlag then break end
+					local before = workspaceModelCount()
+					local a1, a2 = t[2], t[3]
+					local ok, err = pcall(function()
+						if isFunc then
+							if a2 ~= nil then
+								r:InvokeServer(a1, a2)
+							elseif a1 ~= nil then
+								r:InvokeServer(a1)
+							else
+								r:InvokeServer()
+							end
+						else
+							if a2 ~= nil then
+								r:FireServer(a1, a2)
+							elseif a1 ~= nil then
+								r:FireServer(a1)
+							else
+								r:FireServer()
+							end
+						end
+					end)
+					task.wait(1.5)
+					local after = workspaceModelCount()
+					log(string.format("проба %s %s -> %s | моделей в workspace %d -> %d | на самокате: %s",
+						r.Name, t[1], ok and "отправлено" or ("ошибка: " .. tostring(err)),
+						before, after, tostring(isMounted())))
+				end
+			end
+		end
+		probe.running = false
+		srvStatus.Text = "серверный спавн: проба завершена"
+		log("проба завершена")
+	end)
+end
+
+-- =========================================================
+-- ПРИЗЫВ: телепортировать самокат к себе
+-- Если сетевой владелец модели — ты, перемещение уходит на сервер
+-- через физику, и его видят ВСЕ. Это самый рабочий путь без хуков.
+-- =========================================================
+local function isScooterName(name)
+	local n = string.lower(tostring(name))
+	if string.find(n, "decor", 1, true) then return false end
+	if string.find(n, "kukirin", 1, true) then return true end
+	if string.find(n, "scoot", 1, true) then return true end
+	for _, t in ipairs(my.templates) do
+		if string.lower(t.Name) == n then return true end
+	end
+	return false
+end
+
+local function collectWorldScooters()
+	local res = {}
+	local function scan(container, depth)
+		for _, o in ipairs(container:GetChildren()) do
+			if o:IsA("Model") and isScooterName(o.Name) then
+				res[#res + 1] = o
+			elseif depth < 1 and (o:IsA("Model") or o:IsA("Folder")) then
+				scan(o, depth + 1)
+			end
+		end
+	end
+	scan(workspace, 0)
+	return res
+end
+
+local function networkOwnerName(model)
+	for _, p in ipairs(model:GetDescendants()) do
+		if p:IsA("BasePart") then
+			local ok, owner = pcall(function() return p:GetNetworkOwner() end)
+			if ok then
+				if owner then return owner.Name end
+				return "сервер"
+			end
+		end
+	end
+	return "?"
+end
+
+local function summonScooter()
+	if not (root and root.Parent) then return end
+	local all = collectWorldScooters()
+	local list = {}
+	for _, m in ipairs(all) do
+		if not my.clones[m] then
+			list[#list + 1] = m
+		end
+	end
+	if #list == 0 then
+		log("призыв: в workspace не нашёл ни одной модели самоката")
+		srvStatus.Text = "призыв: рядом нет моделей самокатов"
+		return
+	end
+
+	local best, bestD
+	for _, m in ipairs(list) do
+		local ok, cf = pcall(function() return m:GetPivot() end)
+		if ok and cf then
+			local d = (cf.Position - root.Position).Magnitude
+			if not bestD or d < bestD then
+				bestD, best = d, m
+			end
+		end
+	end
+	if not best then return end
+
+	local owner = networkOwnerName(best)
+	local mineBy = string.find(string.lower(best.Name), string.lower(player.Name), 1, true) ~= nil
+	log(string.format("призыв: %s (%s, %.0f студов) | сетевой владелец: %s",
+		best.Name, mineBy and "по имени твой" or "чужой", bestD or -1, owner))
+	if owner == player.Name then
+		log("призыв: владелец ты — перемещение уйдёт на сервер, его увидят ВСЕ")
+	else
+		log("призыв: владелец не ты — сервер может откатить, тогда увидишь только ты")
+	end
+
+	local deck = root.CFrame * CFrame.new(0, 3, 0)
+	local ok, err = pcall(function()
+		best:PivotTo(deck)
+		for _, p in ipairs(best:GetDescendants()) do
+			if p:IsA("BasePart") then
+				p.AssemblyLinearVelocity = Vector3.new(0, 0, 0)
+				p.AssemblyAngularVelocity = Vector3.new(0, 0, 0)
+			end
+		end
+	end)
+	log(ok and "призыв: самокат перемещён под тебя" or ("призыв: не вышло — " .. tostring(err)))
+	srvStatus.Text = string.format("призыв: %s | владелец: %s", best.Name, owner)
+end
+
+-- =========================================================
+-- ПОВТОР ВЫЗОВА НА СЕРВЕР
+--     Это буквально "отправить на сервер то же, что отправил сам
+--     скутер-клиент": мы записали вызов хуком и шлём его снова.
+--     Покупки (purchase/buy) повторять нельзя — это тратит деньги.
+-- =========================================================
+local function replayLastCall()
+	if not lastCall then
+		log("повтор: ничего не записано — сначала нажми Лог ремоутов 20 сек и сделай действие")
+		srvStatus.Text = "повтор: нечего повторять"
+		return
+	end
+	local r = lastCall.remote
+	if not (r and r.Parent) then
+		log("повтор: ремоут уже не существует")
+		return
+	end
+	local low = string.lower(r.Name)
+	if string.find(low, "purchase", 1, true) or string.find(low, "buy", 1, true) or string.find(low, "redeem", 1, true) then
+		log("повтор: " .. r.Name .. " — это покупка, повторять не буду (списывает деньги)")
+		return
+	end
+
+	local n = lastCall.args.n or #lastCall.args
+	local ok, err = pcall(function()
+		if r:IsA("RemoteFunction") then
+			r:InvokeServer(table.unpack(lastCall.args, 1, n))
+		else
+			r:FireServer(table.unpack(lastCall.args, 1, n))
+		end
+	end)
+	log(string.format("повтор %s%s -> %s", r.Name, argsToStr(table.unpack(lastCall.args, 1, n)),
+		ok and "отправлено" or ("ошибка: " .. tostring(err))))
+	srvStatus.Text = "повтор: " .. r.Name .. (ok and " отправлен" or " ошибка")
+end
+
+btnSummon.MouseButton1Click:Connect(summonScooter)
+btnReplay.MouseButton1Click:Connect(replayLastCall)
+btnCap.MouseButton1Click:Connect(function()
+	startCapture(20)
+end)
+btnProbe.MouseButton1Click:Connect(probeSpawn)
+btnStopP.MouseButton1Click:Connect(function()
+	probe.stopFlag = true
+	capture.logging = false
+	log("остановлено вручную")
+end)
+
+log("готово: Призвать самокат | Повторить вызов | Лог ремоутов 20с | Проба SpawnScooter")
+log("подсказка: сетевой владелец виден в логе призыва — если владелец ты, движение самоката уходит на сервер и его видят все")
