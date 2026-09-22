@@ -1,330 +1,571 @@
 --[[═════════════════════════════════════════════════════════════════════════
-    MEMORY SCRIPT EXTRACTOR (пост-фактум дамп из памяти Luau VM)
+    SCRIPT MEMORY INTERCEPTOR  — запускать ПЕРВЫМ
     ─────────────────────────────────────────────────────────────────────────
-    ИНСТРУКЦИЯ:
-    1) Запусти нужный скрипт через loadstring (он уже отработал и находится в памяти).
-    2) Запусти ЭТОТ скрипт (script_memory.lua).
-    3) Он сканирует внутреннюю память Luau VM (Garbage Collector, Registry,
-       активные потоки/корутины и глобальное окружение), находит созданные скриптом
-       функции, реконструирует строки, константы и выкачивает найденный исходник.
+    ПОРЯДОК:
+      1) Запусти ЭТО (script_memory.lua) — ставит хуки и ждёт.
+      2) Запусти любой скрипт через loadstring / HttpGet.
+      3) В момент вызова loadstring() скрипт:
+           a) сохраняет RAW исходник как есть
+           b) делает снимок GC ДО выполнения целевого скрипта
+           c) пропускает скрипт, ждёт пока он загрузится в память
+           d) делает снимок GC ПОСЛЕ — находит новые объекты (функции, строки)
+           e) обходит ВСЁ дерево замыканий до упора
+              — getconstants, getupvalues, getprotos рекурсивно
+              — debug.getinfo на каждой функции
+              — decompile() если есть
+           f) вытаскивает все URL, строки-кусочки кода, байткод
+           g) сохраняет всё в workspace/ScriptMemDump/
 
-    Куда сохраняется:
-    workspace/ScriptMemoryDumps/<дата_сессии>/
-        - sources/       — все обнаруженные куски исходного кода (Lua/Luau)
-        - full_memory_dump.txt — структурированный отчёт по всем найденным функциям
-        - captured_urls.txt    — все URL-адреса, найденные в константах/памяти
+    Хуки:
+      • loadstring (главный)
+      • game:HttpGet / HttpGetAsync (через hookmetamethod)
+      • request / http_request / syn_request
+
+    Файловая структура вывода:
+      ScriptMemDump/<сессия>/dump_N/
+        raw_source.lua        — исходник как был передан в loadstring
+        decompiled.lua        — байткод-декомпиляция (если decompile() есть)
+        functions.txt         — все замыкания: константы + upvalues + protos
+        gc_new_strings.txt    — новые строки в памяти после запуска скрипта
+        urls.txt              — все URL из памяти
+        http_N_<name>.lua     — тела HttpGet ответов
 ═══════════════════════════════════════════════════════════════════════════]]
 
 local genv = (typeof(getgenv) == "function") and getgenv() or _G
 
---// Проверка API эксплойта ────────────────────────────────────────────────
-local HAS_FS = (typeof(writefile) == "function")
-	and (typeof(isfolder) == "function")
-	and (typeof(makefolder) == "function")
-
-local getgc_fn         = (typeof(getgc) == "function") and getgc or nil
-local getreg_fn        = (typeof(debug) == "table" and typeof(debug.getregistry) == "function") and debug.getregistry or nil
-local getconstants_fn  = (typeof(getconstants) == "function") and getconstants or nil
-local getupvalues_fn   = (typeof(getupvalues) == "function") and getupvalues or nil
-local getprotos_fn     = (typeof(getprotos) == "function") and getprotos or nil
-local getinfo_fn       = (typeof(debug) == "table" and typeof(debug.getinfo) == "function") and debug.getinfo or nil
-local iscclosure_fn    = (typeof(iscclosure) == "function") and iscclosure or nil
-local islclosure_fn    = (typeof(islclosure) == "function") and islclosure or nil
-
-local ROOT = "ScriptMemoryDumps"
-local sessionName = tostring(math.floor(tick()))
-do
-	local ok, stamp = pcall(os.date, "%Y-%m-%d_%H-%M-%S")
-	if ok and type(stamp) == "string" then sessionName = stamp end
+if genv.__SMI_ACTIVE then
+	warn("[SMI] Уже активен. Перезапуск не нужен.")
+	return
 end
-local SESSION = ROOT .. "/" .. sessionName
-local SOURCES_DIR = SESSION .. "/sources"
+genv.__SMI_ACTIVE = true
 
---// Утилиты файловой системы ──────────────────────────────────────────────
-local function ensureDir(path)
+---------------------------------------------------------------------------
+-- API ЭКСПЛОЙТА
+---------------------------------------------------------------------------
+local HAS_FS         = (typeof(writefile)  == "function") and (typeof(isfolder) == "function") and (typeof(makefolder) == "function")
+local getgc_fn       = (typeof(getgc)      == "function") and getgc       or nil
+local getreg_fn      = (typeof(debug) == "table" and typeof(debug.getregistry) == "function") and debug.getregistry or nil
+local getconst_fn    = (typeof(getconstants)== "function") and getconstants or nil
+local getupval_fn    = (typeof(getupvalues) == "function") and getupvalues  or nil
+local getprotos_fn   = (typeof(getprotos)   == "function") and getprotos    or nil
+local getinfo_fn     = (typeof(debug) == "table" and typeof(debug.getinfo) == "function") and debug.getinfo or nil
+local decompile_fn   = (typeof(decompile)   == "function") and decompile    or nil
+local iscclosure_fn  = (typeof(iscclosure)  == "function") and iscclosure   or nil
+local islclosure_fn  = (typeof(islclosure)  == "function") and islclosure   or nil
+
+---------------------------------------------------------------------------
+-- ПАПКИ СЕССИИ
+---------------------------------------------------------------------------
+local ROOT = "ScriptMemDump"
+local sessionName = tostring(math.floor(tick()))
+do local ok, s = pcall(os.date, "%Y-%m-%d_%H-%M-%S"); if ok and type(s) == "string" then sessionName = s end end
+local SESSION = ROOT .. "/" .. sessionName
+local dumpIndex = 0
+local httpIndex = 0
+
+---------------------------------------------------------------------------
+-- УТИЛИТЫ FS
+---------------------------------------------------------------------------
+local function ensureDir(p)
 	if not HAS_FS then return end
-	if not isfolder(path) then pcall(makefolder, path) end
+	if not isfolder(p) then pcall(makefolder, p) end
 end
 
 local function saveFile(path, content)
-	if not HAS_FS then
-		warn("[MemoryExtractor] Нет FS. Лог: " .. path)
-		return
-	end
-	local ok, err = pcall(writefile, path, tostring(content))
-	if not ok then
-		warn("[MemoryExtractor] Ошибка записи: " .. tostring(err))
-	end
+	if not HAS_FS then print("[SMI] " .. path .. "\n" .. tostring(content)); return end
+	local ok, e = pcall(writefile, path, tostring(content))
+	if not ok then warn("[SMI] writefile err: " .. tostring(e)) end
 end
 
-local function notify(title, text)
-	pcall(function()
-		game:GetService("StarterGui"):SetCore("SendNotification", {
-			Title = title, Text = text, Duration = 5,
-		})
-	end)
+local function notify(t, tx)
+	pcall(function() game:GetService("StarterGui"):SetCore("SendNotification", { Title = t, Text = tx, Duration = 5 }) end)
 end
 
 ensureDir(ROOT)
 ensureDir(SESSION)
-ensureDir(SOURCES_DIR)
 
---// Структуры для сбора данных ────────────────────────────────────────────
-local visited = {}
-local foundSources = {}
-local foundUrls = {}
-local dumpReport = {}
-local totalClosuresScanned = 0
+---------------------------------------------------------------------------
+-- ФИЛЬТРЫ
+---------------------------------------------------------------------------
+-- Является ли функция Lua-замыканием (не C)?
+local function isLuaFunc(fn)
+	if typeof(fn) ~= "function" then return false end
+	if iscclosure_fn then local ok, v = pcall(iscclosure_fn, fn); if ok and v then return false end end
+	if islclosure_fn then local ok, v = pcall(islclosure_fn, fn); if ok and not v then return false end end
+	return true
+end
 
-local function addReport(line)
-	if #dumpReport < 8000 then
-		dumpReport[#dumpReport + 1] = line
+-- Похожа ли строка на Lua-исходник?
+local LUA_PATTERNS = {
+	"local%s+%w", "function%s+%w", "function%s*%(", "end%s*$", "return%s",
+	"game:GetService", "workspace%.", "Players%.", "GetService%(",
+	"loadstring", "pcall", "task%.spawn", "coroutine%.",
+	"if%s+.+%s+then", "for%s+%w", "while%s+.+%s+do",
+}
+local function isLikelyCode(s)
+	if type(s) ~= "string" or #s < 30 then return false end
+	local hits = 0
+	for _, p in ipairs(LUA_PATTERNS) do
+		if s:find(p) then hits = hits + 1 end
+		if hits >= 2 then return true end
 	end
+	return false
 end
 
--- Проверка: похожа ли строка на фрагмент исходного кода Lua
-local function isLikelyCode(str)
-	if type(str) ~= "string" or #str < 40 then return false end
-
-	-- Ключевые слова и конструкции Lua
-	local matches = 0
-	if str:find("function", 1, true) then matches = matches + 1 end
-	if str:find("local ", 1, true) then matches = matches + 1 end
-	if str:find("game:", 1, true) or str:find("GetService", 1, true) then matches = matches + 1 end
-	if str:find("then", 1, true) and str:find("end", 1, true) then matches = matches + 1 end
-	if str:find("return", 1, true) then matches = matches + 1 end
-	if str:find("pcall", 1, true) or str:find("task%.spawn", 1, true) then matches = matches + 1 end
-
-	return matches >= 2
+-- Является ли строка URL?
+local function isUrl(s)
+	return type(s) == "string" and (s:match("^https?://") ~= nil or s:match("^http://") ~= nil)
 end
 
--- Извлечение URL
-local function checkUrl(str)
-	if type(str) == "string" and (str:find("https?://") or str:find("loadstring")) then
-		if not foundUrls[str] then
-			foundUrls[str] = true
-		end
-	end
-end
-
--- Форматирование значений констант
-local function formatVal(v)
+---------------------------------------------------------------------------
+-- ФОРМАТИРОВАНИЕ ЗНАЧЕНИЙ (для отчёта functions.txt)
+---------------------------------------------------------------------------
+local function fmtVal(v)
 	local t = typeof(v)
 	if t == "string" then
-		checkUrl(v)
-		if isLikelyCode(v) and not foundSources[v] then
-			foundSources[v] = "string_constant"
-		end
 		local s = v:gsub("%c", " ")
-		if #s > 120 then s = s:sub(1, 120) .. "..." end
+		if #s > 150 then s = s:sub(1, 150) .. "…" end
 		return string.format("%q", s)
-	elseif t == "table" then
-		return "<table>"
-	elseif t == "function" then
-		return "<function>"
+	elseif t == "number" or t == "boolean" then return tostring(v)
+	elseif t == "table" then return "<table>"
+	elseif t == "function" then return "<function>"
+	elseif t == "Instance" then
+		local ok, cls = pcall(function() return v.ClassName end)
+		return "<" .. (ok and tostring(cls) or "Instance") .. ">"
 	end
-	return tostring(v)
+	return "<" .. t .. ">"
 end
 
---// Анализ замыкания (функции в памяти) ────────────────────────────────────
-local function inspectClosure(fn, depth)
-	if depth > 4 or visited[fn] then return end
-	visited[fn] = true
+---------------------------------------------------------------------------
+-- СНИМОК GC — получить все объекты сейчас
+---------------------------------------------------------------------------
+local function gcSnapshot()
+	local funcs, strings, tables = {}, {}, {}
+	if not getgc_fn then return funcs, strings, tables end
 
-	-- Проверяем, является ли функция Lua-функцией (C-функции пропускаем, они крашат getconstants)
-	if iscclosure_fn then
-		local okC, isC = pcall(iscclosure_fn, fn)
-		if okC and isC then return end
+	local ok, objs = pcall(getgc_fn, true)
+	if not ok or type(objs) ~= "table" then
+		ok, objs = pcall(getgc_fn)
 	end
-	if islclosure_fn then
-		local okL, isL = pcall(islclosure_fn, fn)
-		if okL and not isL then return end
-	end
+	if not ok or type(objs) ~= "table" then return funcs, strings, tables end
 
-	totalClosuresScanned = totalClosuresScanned + 1
-
-	local info = {}
-	if getinfo_fn then
-		pcall(function() info = getinfo_fn(fn) or {} end)
-	end
-
-	local src = info.source or info.short_src or ""
-	if type(src) == "string" and #src > 0 then
-		checkUrl(src)
-		if isLikelyCode(src) and not foundSources[src] then
-			foundSources[src] = "debug_getinfo_source"
+	for _, o in ipairs(objs) do
+		local t = typeof(o)
+		if t == "function" then
+			funcs[o] = true
+		elseif t == "string" then
+			strings[o] = true
+		elseif t == "table" then
+			tables[o] = true
 		end
 	end
+	return funcs, strings, tables
+end
+
+-- Разность двух снимков (новые объекты в B, которых не было в A)
+local function gcDiff(oldSet, newSet)
+	local diff = {}
+	for obj in pairs(newSet) do
+		if not oldSet[obj] then
+			diff[#diff + 1] = obj
+		end
+	end
+	return diff
+end
+
+---------------------------------------------------------------------------
+-- ПОЛНЫЙ ОБХОД ДЕРЕВА ЗАМЫКАНИЙ
+---------------------------------------------------------------------------
+local function deepDumpClosure(fn, lines, visited, depth)
+	if depth > 8 or visited[fn] or not isLuaFunc(fn) then return end
+	visited[fn] = true
+
+	local info = {}
+	if getinfo_fn then pcall(function() info = getinfo_fn(fn) or {} end) end
 
 	local pad = string.rep("  ", depth)
-	addReport(string.format("%s• Func [%s] lines %s-%s (params: %s, what: %s)",
+	lines[#lines + 1] = string.format(
+		"%s[func] src=%s lines=%s..%s params=%s what=%s",
 		pad,
-		tostring(info.short_src or "unknown"):sub(1, 40),
+		tostring(info.short_src or info.source or "?"):sub(1, 60),
 		tostring(info.linedefined or "?"),
 		tostring(info.lastlinedefined or "?"),
 		tostring(info.nparams or "?"),
 		tostring(info.what or "?")
-	))
+	)
 
-	-- Константы функции
-	if getconstants_fn then
-		local okConst, consts = pcall(getconstants_fn, fn)
-		if okConst and type(consts) == "table" and #consts > 0 then
-			local parts = {}
-			for i, c in ipairs(consts) do
-				if i > 40 then
-					parts[#parts + 1] = "... (" .. (#consts - 40) .. " ещё)"
-					break
-				end
-				parts[#parts + 1] = formatVal(c)
-			end
-			addReport(pad .. "    consts: " .. table.concat(parts, ", "))
-		end
-	end
-
-	-- Upvalues функции
-	if getupvalues_fn then
-		local okUv, uvs = pcall(getupvalues_fn, fn)
-		if okUv and type(uvs) == "table" and #uvs > 0 then
-			local parts = {}
+	-- Upvalues
+	if getupval_fn then
+		local ok, uvs = pcall(getupval_fn, fn)
+		if ok and type(uvs) == "table" then
 			for i, uv in ipairs(uvs) do
-				if i > 30 then
-					parts[#parts + 1] = "... (" .. (#uvs - 30) .. " ещё)"
-					break
-				end
-				parts[#parts + 1] = "uv" .. i .. "=" .. formatVal(uv)
+				if i > 60 then lines[#lines + 1] = pad .. "  ... upvalues truncated"; break end
+				lines[#lines + 1] = pad .. "  upval[" .. i .. "] = " .. fmtVal(uv)
 				if typeof(uv) == "function" then
-					inspectClosure(uv, depth + 1)
+					deepDumpClosure(uv, lines, visited, depth + 1)
 				end
 			end
-			addReport(pad .. "    upvalues: " .. table.concat(parts, ", "))
 		end
 	end
 
-	-- Вложенные прототипы (sub-функции)
+	-- Константы
+	if getconst_fn then
+		local ok, cs = pcall(getconst_fn, fn)
+		if ok and type(cs) == "table" and #cs > 0 then
+			local parts = {}
+			for i, c in ipairs(cs) do
+				if i > 100 then parts[#parts + 1] = "…(" .. (#cs - 100) .. " more)"; break end
+				parts[#parts + 1] = fmtVal(c)
+			end
+			lines[#lines + 1] = pad .. "  consts[" .. #cs .. "]: " .. table.concat(parts, ", ")
+		end
+	end
+
+	-- Прототипы (вложенные функции)
 	if getprotos_fn then
-		local okProto, protos = pcall(getprotos_fn, fn)
-		if okProto and type(protos) == "table" then
-			for i, proto in ipairs(protos) do
-				if i > 25 then break end
-				if typeof(proto) == "function" then
-					inspectClosure(proto, depth + 1)
+		local ok, ps = pcall(getprotos_fn, fn)
+		if ok and type(ps) == "table" then
+			for i, p in ipairs(ps) do
+				if i > 40 then lines[#lines + 1] = pad .. "  ... protos truncated"; break end
+				if typeof(p) == "function" then
+					deepDumpClosure(p, lines, visited, depth + 1)
 				end
 			end
 		end
 	end
 end
 
---// Главный сборщик из кучи памяти (GC) ────────────────────────────────────
-print("[MemoryExtractor] Начинаю сканирование памяти Luau VM...")
-notify("MemoryExtractor", "Сканирую оперативную память...")
+---------------------------------------------------------------------------
+-- ИЗВЛЕЧЕНИЕ СТРОК И URL ИЗ КОНСТАНТЫ ВСЕГО ДЕРЕВА
+---------------------------------------------------------------------------
+local function collectStringsFromClosure(fn, outStrings, outUrls, visited, depth)
+	if depth > 8 or visited[fn] or not isLuaFunc(fn) then return end
+	visited[fn] = true
 
--- 1. Сканируем getgc()
-if getgc_fn then
-	local okGc, gcObjects = pcall(getgc_fn, true)
-	if not okGc or type(gcObjects) ~= "table" then
-		okGc, gcObjects = pcall(getgc_fn)
-	end
-
-	if okGc and type(gcObjects) == "table" then
-		print("[MemoryExtractor] Найдено объектов в GC: " .. #gcObjects)
-		for _, obj in ipairs(gcObjects) do
-			local t = typeof(obj)
-			if t == "function" then
-				pcall(inspectClosure, obj, 0)
-			elseif t == "string" then
-				checkUrl(obj)
-				if isLikelyCode(obj) and not foundSources[obj] then
-					foundSources[obj] = "gc_string_heap"
+	if getconst_fn then
+		local ok, cs = pcall(getconst_fn, fn)
+		if ok and type(cs) == "table" then
+			for _, c in ipairs(cs) do
+				if type(c) == "string" then
+					if isUrl(c) then outUrls[c] = "constant" end
+					if isLikelyCode(c) then outStrings[c] = "constant_code" end
 				end
-			elseif t == "table" then
-				-- Проверяем строковые поля в глобальных таблицах
-				pcall(function()
-					for k, v in pairs(obj) do
-						if typeof(v) == "string" then
-							checkUrl(v)
-							if isLikelyCode(v) and not foundSources[v] then
-								foundSources[v] = "table_value"
-							end
-						elseif typeof(v) == "function" then
-							inspectClosure(v, 0)
-						end
-					end
-				end)
 			end
 		end
-	else
-		warn("[MemoryExtractor] getgc() вернул ошибку")
 	end
-else
-	warn("[MemoryExtractor] getgc() не поддерживается твоим эксплойтом")
-end
 
--- 2. Сканируем debug.getregistry()
-if getreg_fn then
-	local okReg, reg = pcall(getreg_fn)
-	if okReg and type(reg) == "table" then
-		print("[MemoryExtractor] Сканирую реестр Luau...")
-		for _, v in pairs(reg) do
-			if typeof(v) == "function" then
-				pcall(inspectClosure, v, 0)
-			elseif typeof(v) == "string" and isLikelyCode(v) then
-				foundSources[v] = "registry_string"
+	if getupval_fn then
+		local ok, uvs = pcall(getupval_fn, fn)
+		if ok and type(uvs) == "table" then
+			for _, uv in ipairs(uvs) do
+				if type(uv) == "string" then
+					if isUrl(uv) then outUrls[uv] = "upvalue" end
+					if isLikelyCode(uv) then outStrings[uv] = "upvalue_code" end
+				elseif typeof(uv) == "function" then
+					collectStringsFromClosure(uv, outStrings, outUrls, visited, depth + 1)
+				end
+			end
+		end
+	end
+
+	if getprotos_fn then
+		local ok, ps = pcall(getprotos_fn, fn)
+		if ok and type(ps) == "table" then
+			for _, p in ipairs(ps) do
+				if typeof(p) == "function" then
+					collectStringsFromClosure(p, outStrings, outUrls, visited, depth + 1)
+				end
 			end
 		end
 	end
 end
 
--- 3. Сканируем глобальное окружение
-pcall(function()
-	for k, v in pairs(genv) do
-		if typeof(v) == "function" then
-			pcall(inspectClosure, v, 0)
-		end
-	end
-end)
+---------------------------------------------------------------------------
+-- ГЛАВНЫЙ ДАМПЕР — вызывается после перехвата loadstring
+---------------------------------------------------------------------------
+local function performDump(rawSource, chunkName, compiledFn, gcBefore)
 
---// Сохранение результатов ────────────────────────────────────────────────
-local sourceIndex = 0
-for codeSnippet, origin in pairs(foundSources) do
-	sourceIndex = sourceIndex + 1
-	local fileName = SOURCES_DIR .. "/source_" .. sourceIndex .. ".lua"
+	dumpIndex = dumpIndex + 1
+	local folder = SESSION .. "/dump_" .. dumpIndex
+	ensureDir(folder)
+
+	-- ── 1. RAW исходник ─────────────────────────────────────────────────
 	local header = table.concat({
-		"-- [MemoryExtractor] Исходник #" .. sourceIndex,
-		"-- Источник в памяти: " .. tostring(origin),
-		"-- Длина: " .. #codeSnippet .. " символов",
-		"----------------------------------------------------------------",
+		"-- [SMI] RAW SOURCE DUMP #" .. dumpIndex,
+		"-- chunkname: " .. tostring(chunkName or "unknown"),
+		"-- size: " .. tostring(rawSource and #rawSource or 0) .. " chars",
+		"-- session: " .. sessionName,
 		"",
+		""
 	}, "\n")
-	saveFile(fileName, header .. codeSnippet)
-	print("[MemoryExtractor] Обнаружен исходник скрипта! Сохранён в: " .. fileName)
+	saveFile(folder .. "/raw_source.lua", header .. tostring(rawSource or "(nil)"))
+
+	-- ── 2. Деcompиляция байткода (только если decompile() есть) ─────────
+	if decompile_fn and compiledFn then
+		-- decompile() безопасно вызываем только на Lua-функциях
+		if isLuaFunc(compiledFn) then
+			local ok, dec = pcall(decompile_fn, compiledFn)
+			if ok and type(dec) == "string" and #dec > 0 then
+				saveFile(folder .. "/decompiled.lua", dec)
+			else
+				saveFile(folder .. "/decompiled.lua", "-- decompile() failed: " .. tostring(dec))
+			end
+		end
+	end
+
+	-- ── 3. Ждём немного чтобы скрипт успел запуститься и осесть в памяти
+	task.delay(0.35, function()
+		local ok, err = pcall(function()
+
+			-- Снимок GC ПОСЛЕ запуска
+			local gcFuncsAfter, gcStringsAfter, _ = gcSnapshot()
+
+			-- Новые функции появившиеся после запуска скрипта
+			local newFuncs = {}
+			do
+				local oldFuncs = gcBefore.funcs or {}
+				for fn in pairs(gcFuncsAfter) do
+					if not oldFuncs[fn] then newFuncs[#newFuncs + 1] = fn end
+				end
+			end
+
+			-- Новые строки
+			local newStrings = {}
+			do
+				local oldStrings = gcBefore.strings or {}
+				for s in pairs(gcStringsAfter) do
+					if not oldStrings[s] then newStrings[#newStrings + 1] = s end
+				end
+			end
+
+			print(string.format("[SMI] GC diff: +%d функций, +%d строк в памяти", #newFuncs, #newStrings))
+
+			-- ── 4. Полный дамп всех новых замыканий ─────────────────────
+			local funcLines = {
+				"=== SMI FUNCTION DUMP #" .. dumpIndex .. " ===",
+				"chunkname: " .. tostring(chunkName or "?"),
+				"new closures found: " .. #newFuncs,
+				""
+			}
+			local visitedF = {}
+
+			-- Сначала дампим скомпилированную функцию из loadstring (корень)
+			if compiledFn and isLuaFunc(compiledFn) then
+				funcLines[#funcLines + 1] = "=== ROOT (compiled fn from loadstring) ==="
+				deepDumpClosure(compiledFn, funcLines, visitedF, 0)
+			end
+
+			-- Потом все новые функции из GC
+			funcLines[#funcLines + 1] = ""
+			funcLines[#funcLines + 1] = "=== NEW CLOSURES FROM GC ==="
+			for _, fn in ipairs(newFuncs) do
+				if isLuaFunc(fn) then
+					deepDumpClosure(fn, funcLines, visitedF, 0)
+				end
+			end
+
+			saveFile(folder .. "/functions.txt", table.concat(funcLines, "\n"))
+
+			-- ── 5. Строки-фрагменты кода и URL из памяти ─────────────────
+			local codeStrings = {}
+			local urlStrings  = {}
+
+			-- Из новых GC строк
+			for _, s in ipairs(newStrings) do
+				if isUrl(s) then urlStrings[s] = "gc_new" end
+				if isLikelyCode(s) then codeStrings[s] = "gc_new_string" end
+			end
+
+			-- Из констант/upvalues всех новых замыканий
+			local visitedS = {}
+			for _, fn in ipairs(newFuncs) do
+				collectStringsFromClosure(fn, codeStrings, urlStrings, visitedS, 0)
+			end
+			if compiledFn and isLuaFunc(compiledFn) then
+				collectStringsFromClosure(compiledFn, codeStrings, urlStrings, visitedS, 0)
+			end
+
+			-- Сохраняем найденные строки кода (обфускатор мог раздробить скрипт)
+			local gcStringLines = { "=== NEW STRINGS IN MEMORY AFTER SCRIPT RUN ===", "" }
+			local codeIdx = 0
+			for snippet, origin in pairs(codeStrings) do
+				codeIdx = codeIdx + 1
+				gcStringLines[#gcStringLines + 1] = ("-- [%d] origin=%s len=%d"):format(codeIdx, origin, #snippet)
+				gcStringLines[#gcStringLines + 1] = snippet
+				gcStringLines[#gcStringLines + 1] = ""
+			end
+			if codeIdx == 0 then gcStringLines[#gcStringLines + 1] = "(нет фрагментов кода в новых строках GC)" end
+			saveFile(folder .. "/gc_new_strings.txt", table.concat(gcStringLines, "\n"))
+
+			-- ── 6. Список URL ─────────────────────────────────────────────
+			local urlLines = { "=== CAPTURED URLS ===" }
+			for u, origin in pairs(urlStrings) do
+				urlLines[#urlLines + 1] = "[" .. origin .. "] " .. u
+			end
+			if #urlLines == 1 then urlLines[#urlLines + 1] = "(URL не найдены)" end
+			saveFile(folder .. "/urls.txt", table.concat(urlLines, "\n"))
+
+			-- ── 7. Сводка ─────────────────────────────────────────────────
+			local summary = table.concat({
+				"=== SMI SUMMARY #" .. dumpIndex .. " ===",
+				"chunkname:      " .. tostring(chunkName or "?"),
+				"source size:    " .. tostring(rawSource and #rawSource or 0) .. " chars",
+				"new closures:   " .. #newFuncs,
+				"new gc strings: " .. #newStrings,
+				"code snippets:  " .. codeIdx,
+				"urls found:     " .. (function() local n = 0; for _ in pairs(urlStrings) do n = n + 1 end; return n end)(),
+				"files saved to: " .. folder,
+			}, "\n")
+			saveFile(folder .. "/summary.txt", summary)
+
+			local msg = ("Дамп #%d готов! +%d замыканий, +%d строк → %s"):format(
+				dumpIndex, #newFuncs, #newStrings, folder)
+			print("[SMI] " .. msg)
+			notify("ScriptMemoryInterceptor", msg)
+		end)
+
+		if not ok then
+			warn("[SMI] Ошибка в performDump: " .. tostring(err))
+		end
+	end)
 end
 
--- Сохраняем найденные URL (скрипты на гитхабе/пастебине, откуда грузился лоадстринг)
-local urlList = {}
-for u, _ in pairs(foundUrls) do
-	urlList[#urlList + 1] = u
-end
-if #urlList > 0 then
-	saveFile(SESSION .. "/captured_urls.txt", table.concat(urlList, "\n"))
-	print("[MemoryExtractor] Найдено URL в памяти: " .. #urlList)
+---------------------------------------------------------------------------
+-- ХУК НА loadstring
+---------------------------------------------------------------------------
+local originalLoadstring = genv.loadstring
+if typeof(originalLoadstring) ~= "function" and _G then
+	originalLoadstring = _G.loadstring
 end
 
--- Сохраняем полный отчёт по функциям
-local reportSummary = table.concat({
-	"=== Memory Extractor Report ===",
-	"Сессия: " .. sessionName,
-	"Всего исследовано функций в памяти: " .. totalClosuresScanned,
-	"Найдено фрагментов кода/исходников: " .. sourceIndex,
-	"Найдено адресов загрузки (URLs): " .. #urlList,
-	"----------------------------------------------------------------",
-	"",
-	table.concat(dumpReport, "\n")
-}, "\n")
+if typeof(originalLoadstring) ~= "function" then
+	warn("[SMI] loadstring не найден — основной хук не установлен!")
+else
+	local function hookedLoadstring(src, chunkname)
+		-- Снимок GC ДО компиляции (ловим разницу объектов)
+		local gcFuncsBefore, gcStrsBefore, _ = gcSnapshot()
+		local gcBefore = { funcs = gcFuncsBefore, strings = gcStrsBefore }
 
-saveFile(SESSION .. "/full_memory_dump.txt", reportSummary)
+		-- Компилируем через оригинал
+		local compOk, fn, compErr = true, nil, nil
+		do
+			local r1, r2
+			compOk, r1, r2 = pcall(originalLoadstring, src, chunkname)
+			if compOk then
+				fn, compErr = r1, r2
+			else
+				fn, compErr = nil, tostring(r1)
+				compOk = true -- для return ниже
+			end
+		end
 
--- Итоги
-local resultMsg = string.format("Готово! Найдено исходников: %d, URL: %d. Папка: %s", sourceIndex, #urlList, SESSION)
-print("[MemoryExtractor] " .. resultMsg)
-notify("MemoryExtractor", resultMsg)
+		print(string.format("[SMI] Перехват loadstring! chunk=%q size=%d compiled=%s",
+			tostring(chunkname or "?"):sub(1, 40),
+			type(src) == "string" and #src or 0,
+			typeof(fn) == "function" and "YES" or ("NO:" .. tostring(compErr))
+		))
+
+		-- Запускаем дамп асинхронно чтобы не тормозить сам скрипт
+		task.spawn(function()
+			performDump(src, chunkname, typeof(fn) == "function" and fn or nil, gcBefore)
+		end)
+
+		-- Возвращаем результат как есть — скрипт работает нормально
+		if typeof(fn) == "function" then
+			return fn, compErr
+		else
+			return nil, compErr
+		end
+	end
+
+	-- Подменяем в genv и _G
+	pcall(function() genv.loadstring = hookedLoadstring end)
+	pcall(function() if _G then _G.loadstring = hookedLoadstring end end)
+
+	-- Резерв: hookfunction если прямое присвоение не сработало
+	if genv.loadstring ~= hookedLoadstring and typeof(hookfunction) == "function" then
+		local trampoline
+		local hOk = pcall(function()
+			trampoline = hookfunction(originalLoadstring, function(src, chunkname)
+				return hookedLoadstring(src, chunkname)
+			end)
+		end)
+		if hOk and trampoline then
+			originalLoadstring = trampoline
+			print("[SMI] Использован hookfunction для loadstring")
+		end
+	end
+
+	print("[SMI] Хук loadstring установлен ✓")
+end
+
+---------------------------------------------------------------------------
+-- ХУК НА HttpGet / HttpGetAsync
+---------------------------------------------------------------------------
+if typeof(hookmetamethod) == "function" then
+	local oldNamecall
+	local ok, err = pcall(function()
+		oldNamecall = hookmetamethod(game, "__namecall", function(self, ...)
+			local method = typeof(getnamecallmethod) == "function" and getnamecallmethod() or nil
+			if method == "HttpGet" or method == "HttpGetAsync" then
+				local args = table.pack(...)
+				local url = tostring(args[1] or "")
+				if typeof(setnamecallmethod) == "function" then setnamecallmethod(method) end
+				local results = table.pack(oldNamecall(self, table.unpack(args, 1, args.n)))
+				if typeof(results[1]) == "string" and #results[1] > 0 then
+					local body = results[1]
+					task.spawn(function()
+						pcall(function()
+							httpIndex = httpIndex + 1
+							local fname = SESSION .. "/http_" .. httpIndex .. "_" .. url:gsub("[^%w]","_"):sub(1,48) .. ".lua"
+							saveFile(fname, "-- URL: " .. url .. "\n-- size: " .. #body .. "\n\n" .. body)
+							print("[SMI] HttpGet сохранён → " .. fname)
+						end)
+					end)
+				end
+				return table.unpack(results, 1, results.n)
+			end
+			if typeof(setnamecallmethod) == "function" and method then setnamecallmethod(method) end
+			return oldNamecall(self, ...)
+		end)
+	end)
+	if ok and oldNamecall then
+		print("[SMI] Хук HttpGet (__namecall) установлен ✓")
+	else
+		warn("[SMI] hookmetamethod не сработал: " .. tostring(err))
+	end
+end
+
+---------------------------------------------------------------------------
+-- ХУК НА request / http_request / syn_request
+---------------------------------------------------------------------------
+for _, rname in ipairs({ "request", "http_request", "syn_request" }) do
+	local orig = genv[rname]
+	if typeof(orig) == "function" then
+		pcall(function()
+			genv[rname] = function(opts, ...)
+				local results = table.pack(orig(opts, ...))
+				if typeof(opts) == "table" and type(opts.Url) == "string"
+					and typeof(results[1]) == "table" and type(results[1].Body) == "string" then
+					local url, body = opts.Url, results[1].Body
+					task.spawn(function()
+						pcall(function()
+							httpIndex = httpIndex + 1
+							local fname = SESSION .. "/http_" .. httpIndex .. "_" .. url:gsub("[^%w]","_"):sub(1,48) .. ".lua"
+							saveFile(fname, "-- URL: " .. url .. " (via " .. rname .. ")\n-- size: " .. #body .. "\n\n" .. body)
+							print("[SMI] request сохранён → " .. fname)
+						end)
+					end)
+				end
+				return table.unpack(results, 1, results.n)
+			end
+		end)
+		print("[SMI] Хук " .. rname .. " установлен ✓")
+	end
+end
+
+---------------------------------------------------------------------------
+-- ГОТОВО
+---------------------------------------------------------------------------
+print("[SMI] ══ АКТИВЕН ══ Жду твой loadstring. Дамп → workspace/" .. SESSION)
+notify("ScriptMemInterceptor", "Активен! Запускай свой loadstring → " .. ROOT)
