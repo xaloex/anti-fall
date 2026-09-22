@@ -1115,7 +1115,17 @@ log("v8 запущен. C — отпустить деку вручную.")
 -- =========================================================
 local SCOOTERS_FOLDER = "Scooters"
 local SPEED_STEPS = { 1, 2, 3, 5, 8 }
-local MAX_SPEED = 320
+local MAX_SPEED = 100000
+
+-- Ручное управление скоростью: любое число, применяется сразу несколькими способами,
+-- чтобы игра не "съедала" скорость (она перезаписывает физику каждый кадр).
+local speedCtrl = {
+	target = 50,        -- студ/с: ставится вручную в окне СКОРОСТЬ или кнопками xN
+	useLinear = true,   -- LinearVelocity: тяга постоянно тянет сборку к нужной скорости
+	hardMode = true,    -- каждый кадр двигать саму модель (скорость не может упасть)
+	autoDrive = false,  -- ехать без газа
+	maxForce = 1e5,
+}
 
 local my = {
 	templates = {},
@@ -1454,9 +1464,10 @@ btnRide.MouseButton1Click:Connect(rideMine)
 btnDel.MouseButton1Click:Connect(deleteMine)
 btnSpeed.MouseButton1Click:Connect(function()
 	my.speedIdx = (my.speedIdx % #SPEED_STEPS) + 1
-	btnSpeed.Text = "Скорость: x" .. SPEED_STEPS[my.speedIdx]
-	log("скорость самоката: x" .. SPEED_STEPS[my.speedIdx]
-		.. (my.riding and " (мой)" or " (игровой)"))
+	speedCtrl.target = my.baseSpeed * SPEED_STEPS[my.speedIdx]
+	btnSpeed.Text = "Скорость: x" .. SPEED_STEPS[my.speedIdx] .. " (" .. math.floor(speedCtrl.target) .. ")"
+	log("скорость x" .. SPEED_STEPS[my.speedIdx] .. " = " .. math.floor(speedCtrl.target)
+		.. " студ/с" .. (my.riding and " (мой)" or " (игровой)"))
 end)
 
 -- перетаскивание второго окна
