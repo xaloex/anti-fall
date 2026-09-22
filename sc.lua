@@ -1,5 +1,15 @@
 --[[
-    ★ Anti-Looped Out v6.1 ★   (без хуков метатаблиц — крашить нечем)
+    ★ Anti-Looped Out v7 + АВТО-ФАРМ ВИЛИ ★   (без хуков метатаблиц)
+
+    АВТО-ФАРМ (кнопка справа снизу):
+      Игра платит за вили (в логе WheelieReward + CashGain), поэтому фарм =
+      бесконечный вили. Ассист [5] включается сам и держит питч ниже порога
+      LOOPED OUT (~82°), иначе вили превращался бы в срыв.
+      Клавиша вили не нужна заранее: кнопка "Найти клавишу вили" перебирает
+      клавиши и находит ту, что поднимает нос (по атрибуту ScooterPredictedWheelie
+      и углу самоката). Найдёт — будет жать её; не найдёт — будет править
+      атрибуты ScooterLocalThrottle/ScooterLocalWheelie напрямую.
+      В HUD видно: фарм ВКЛ/ВЫКЛ, найденная клавиша, режим и заработанные $.
 
     ЧТО ПОПРАВЛЕНО В v6.1:
       * "боком" — был баг ассиста: поворот шёл вокруг ЛОКАЛЬНОЙ оси, из-за чего
@@ -612,6 +622,227 @@ task.defer(function()
 end)
 
 -- =========================================================
+-- [7] АВТО-ФАРМ ВИЛИ
+--     Игра платит за вили: в логе WheelieReward(()) + CashGain(2, 1).
+--     Значит надо крутить вили БЕСКОНЕЧНО — а ассист [5] не даёт перекрутить
+--     за порог LOOPED OUT (~82°), чтобы не слетать.
+--
+--     Как подаём управление (скрипт выберет сам, что доступно):
+--       "vim"  — VirtualInputManager (работает в Studio/командной строке),
+--       "key"  — executor-функции keypress/keyhold/keyrelease,
+--       "attr" — прямая запись атрибутов ScooterLocalThrottle/ScooterLocalWheelie.
+--     Клавиша вили подбирается калибровкой — вручную знать не нужно.
+-- =========================================================
+local farm = {
+	on = false,
+	method = nil,          -- "vim" | "key" | "attr"
+	throttleKey = Enum.KeyCode.W,
+	wheelieKey = nil,
+	wheelieName = "?",
+	earned = 0,
+	startCash = nil,
+}
+
+local KEYCODES = {
+	W = Enum.KeyCode.W, S = Enum.KeyCode.S, A = Enum.KeyCode.A, D = Enum.KeyCode.D,
+	Space = Enum.KeyCode.Space, Q = Enum.KeyCode.Q, E = Enum.KeyCode.E, Z = Enum.KeyCode.Z,
+	X = Enum.KeyCode.X, R = Enum.KeyCode.R, F = Enum.KeyCode.F, B = Enum.KeyCode.B,
+	Up = Enum.KeyCode.Up, Down = Enum.KeyCode.Down, Left = Enum.KeyCode.Left,
+	Right = Enum.KeyCode.Right, LeftShift = Enum.KeyCode.LeftShift,
+}
+
+local function gget(name)
+	local v = rawget(_G, name)
+	if v == nil then
+		local ok, e = pcall(function() return getfenv(0)[name] end)
+		if ok then v = e end
+	end
+	return v
+end
+
+local VIM
+pcall(function() VIM = game:GetService("VirtualInputManager") end)
+if not VIM then
+	log("VirtualInputManager недоступен — буду пробовать keypress или атрибуты")
+end
+
+local heldKeys = {}
+local function pressKey(kc)
+	if not kc or heldKeys[kc] then return end
+	heldKeys[kc] = true
+	if VIM then
+		pcall(function() VIM:SendKeyEvent(true, kc, false, game) end)
+		return
+	end
+	local kp = gget("keypress")
+	if type(kp) == "function" then
+		pcall(function() kp(kc.Name:lower()) end)
+		return
+	end
+	local kh = gget("keyhold")
+	if type(kh) == "function" then
+		pcall(function() kh(kc.Name:lower()) end)
+	end
+end
+
+local function releaseKey(kc)
+	if not kc or not heldKeys[kc] then return end
+	heldKeys[kc] = nil
+	if VIM then
+		pcall(function() VIM:SendKeyEvent(false, kc, false, game) end)
+		return
+	end
+	local kr = gget("keyrelease")
+	if type(kr) == "function" then
+		pcall(function() kr(kc.Name:lower()) end)
+	end
+end
+
+local function releaseAllKeys()
+	for kc in pairs(heldKeys) do
+		releaseKey(kc)
+	end
+end
+
+-- деньги (в логе есть CashUpdate/CashGain — обычно это leaderstats)
+local function getCash()
+	local ls = player:FindFirstChild("leaderstats")
+	if not ls then return nil end
+	for _, n in ipairs({ "Cash", "Money", "Coins", "Деньги" }) do
+		local c = ls:FindFirstChild(n)
+		if c and c:IsA("ValueBase") and type(c.Value) == "number" then
+			return c.Value
+		end
+	end
+	return nil
+end
+
+-- текущий питч самоката и "сигнал вили" из атрибутов
+local function scooterPitch()
+	local model = findScooterModel()
+	if not model then return 0 end
+	local ok, cf = pcall(function() return model:GetPivot() end)
+	if not ok or not cf then return 0 end
+	local look = cf.LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	if flat.Magnitude < 0.001 then return 0 end
+	flat = flat.Unit
+	return math.deg(-math.asin(math.clamp(cf.UpVector:Dot(flat), -1, 1)))
+end
+
+local function wheelieSignal()
+	local v = 0
+	for _, n in ipairs({ "ScooterPredictedWheelie", "ScooterLocalWheelie" }) do
+		local a = player:GetAttribute(n)
+		if type(a) == "number" then
+			v = math.max(v, math.abs(a))
+		end
+	end
+	return v
+end
+
+-- калибровка: перебираем клавиши и смотрим, какая поднимает нос/сигнал вили
+local calibrating = false
+local function calibrate()
+	if calibrating then return end
+	if not isMounted() then
+		log("калибровка невозможна: сначала сядь на самокат и поезжай")
+		return
+	end
+	calibrating = true
+	log("калибровка: ищу клавишу вили, сам ничего не нажимай ...")
+
+	local bestKey, bestName, bestScore = nil, "?", 0
+	for name, kc in pairs(KEYCODES) do
+		if not farm.on then break end
+		local p0, w0 = scooterPitch(), wheelieSignal()
+		pressKey(kc)
+		task.wait(0.7)
+		local p1, w1 = scooterPitch(), wheelieSignal()
+		releaseKey(kc)
+		task.wait(0.3)
+
+		local score = math.abs(p1 - p0) + math.abs(w1 - w0) * 10
+		log(string.format("  %s: питч %.0f->%.0f | сигнал %.2f->%.2f | очков %.1f",
+			name, p0, p1, w0, w1, score))
+		if score > bestScore then
+			bestScore, bestKey, bestName = score, kc, name
+		end
+	end
+
+	if bestKey and bestScore > 3 then
+		farm.wheelieKey = bestKey
+		farm.wheelieName = bestName
+		farm.method = VIM and "vim" or "key"
+		log(string.format("калибровка: вили делает клавиша %s (очков %.1f) -> режим %s",
+			bestName, bestScore, farm.method))
+	else
+		farm.method = "attr"
+		log("калибровка: клавиша не найдена -> буду подкручивать атрибуты")
+	end
+	calibrating = false
+end
+
+local function farmOff(reason)
+	if not farm.on then return end
+	farm.on = false
+	releaseAllKeys()
+	log("авто-фарм выключен (" .. tostring(reason) .. ") заработано: " .. tostring(farm.earned))
+end
+
+local function farmOn()
+	if farm.on then return end
+	farm.on = true
+	farm.startCash = getCash()
+	farm.earned = 0
+
+	-- без ассиста вили превратится в LOOPED OUT и срыв
+	if not cfg.assist then
+		cfg.assist = true
+		log("авто-фарм: ассист [5] включён автоматически (иначе вили = авария)")
+	end
+
+	if not farm.method then
+		task.spawn(calibrate)
+	end
+	log("авто-фарм включён. Кручу вили бесконечно, ассист держит угол.")
+end
+
+local function farmStep()
+	if not farm.on then return end
+
+	-- если калибровка не прошла (были не на самокате) — попробуем снова на ходу
+	if not farm.method and not calibrating and isMounted() then
+		task.spawn(calibrate)
+	end
+
+	if farm.method == "attr" then
+		pcall(function()
+			player:SetAttribute("ScooterLocalThrottle", 1)
+			player:SetAttribute("ScooterLocalWheelie", 1)
+		end)
+	elseif not calibrating then
+		pressKey(farm.throttleKey)
+		if farm.wheelieKey then
+			pressKey(farm.wheelieKey)
+		end
+	end
+
+	-- если слетел — подержимся на прежнем месте деки и подождём, пока игра посадит
+	if not isMounted() and deckWorld and character and character.Parent then
+		pcall(function() character:PivotTo(deckWorld) end)
+	end
+
+	local c = getCash()
+	if c then
+		if farm.startCash == nil then farm.startCash = c end
+		farm.earned = c - farm.startCash
+	end
+end
+
+RunService.Heartbeat:Connect(farmStep)
+
+-- =========================================================
 -- GUI
 -- =========================================================
 local screenGui = Instance.new("ScreenGui")
@@ -621,7 +852,7 @@ screenGui.Parent = player:WaitForChild("PlayerGui")
 
 local frame = Instance.new("Frame")
 frame.Name = "MainFrame"
-frame.Size = UDim2.new(0, 250, 0, 300)
+frame.Size = UDim2.new(0, 270, 0, 356)
 frame.Position = UDim2.new(0, 20, 0, 90)
 frame.BackgroundColor3 = Color3.fromRGB(26, 26, 30)
 frame.BorderSizePixel = 0
@@ -632,7 +863,7 @@ Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
 local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, 0, 0, 24)
 title.BackgroundTransparency = 1
-title.Text = "★ Anti-Looped Out v6.1 ★"
+title.Text = "★ Anti-Looped Out v7 + ФАРМ ★"
 title.TextColor3 = Color3.fromRGB(255, 255, 255)
 title.TextSize = 13
 title.Font = Enum.Font.SourceSansBold
@@ -663,10 +894,12 @@ local holdBtn   = makeButton("[4] Держать деку", 130, green)
 local assistBtn = makeButton("[5] Ассист (не перекрут)", 156, green)
 local resBtn    = makeButton("[6] Перепроверка", 182, red)
 local resetBtn  = makeButton("Сбросить счётчики", 208, Color3.fromRGB(80, 80, 95))
+local farmBtn   = makeButton("АВТО-ФАРМ ВИЛИ: ВЫКЛ", 234, red)
+local calibBtn  = makeButton("Найти клавишу вили", 260, Color3.fromRGB(60, 90, 150))
 
 local info = Instance.new("TextLabel")
-info.Size = UDim2.new(1, -8, 0, 56)
-info.Position = UDim2.new(0, 4, 1, -60)
+info.Size = UDim2.new(1, -8, 0, 78)
+info.Position = UDim2.new(0, 4, 1, -82)
 info.BackgroundTransparency = 1
 info.TextColor3 = Color3.fromRGB(220, 225, 220)
 info.TextSize = 11
@@ -693,9 +926,10 @@ local function refreshInfo()
 		end
 	end
 	info.Text = string.format(
-		"на деке: %s | угол: %.0f° | %.0f студ/с\nдержу: %s | срывов: %d | ассист: %d\nдека: %s | %s\n%s",
+		"на деке: %s | угол: %.0f° | %.0f студ/с\nдержу: %s | срывов: %d | ассист: %d\nфарм: %s | вили: %s (%s) | +%s$\nдека: %s | %s\n%s",
 		tostring(isMounted()), angle, speed,
 		tostring(holdActive), crashCount, assistClamps,
+		tostring(farm.on), farm.wheelieName, tostring(farm.method), tostring(farm.earned),
 		deckRel and "записана" or "НЕТ", lastAngle,
 		lastCrash)
 end
@@ -713,6 +947,8 @@ masterBtn.MouseButton1Click:Connect(function()
 		log("защита включена")
 	else
 		releaseHold("защита выключена")
+		farmOff("защита выключена")
+		paint(farmBtn, false, "АВТО-ФАРМ ВИЛИ")
 		restoreCrashScripts()
 		log("защита выключена")
 	end
@@ -759,6 +995,24 @@ resBtn.MouseButton1Click:Connect(function()
 	cfg.respeedEvery = (cfg.respeedEvery == 0.5) and 0.05 or 0.5
 	paint(resBtn, cfg.respeedEvery == 0.05, "[6] Перепроверка")
 	log("интервал перепроверки:", cfg.respeedEvery)
+end)
+
+farmBtn.MouseButton1Click:Connect(function()
+	if farm.on then
+		farmOff("кнопка")
+	else
+		farmOn()
+	end
+	paint(farmBtn, farm.on, "АВТО-ФАРМ ВИЛИ")
+	paint(assistBtn, cfg.assist, "[5] Ассист (не перекрут)")
+end)
+
+calibBtn.MouseButton1Click:Connect(function()
+	if not farm.on then
+		farmOn()
+		paint(farmBtn, true, "АВТО-ФАРМ ВИЛИ")
+	end
+	task.spawn(calibrate)
 end)
 
 resetBtn.MouseButton1Click:Connect(function()
