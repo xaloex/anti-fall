@@ -10,14 +10,18 @@
        3. Какие скрипты Scooter включаются и выключаются.
        4. Когда персонаж упал/встал — полный "разбор полёта": состояние,
           положение, расстояние до самоката, кто выключен.
-       5. Кнопка "ПЕРЕХВАТ" — ловит исходящие FireServer из игры
-          (ВКЛЮЧАЙ ОТДЕЛЬНО: у тебя были краши из-за хуков).
-       6. Кнопка "КОПИРОВАТЬ" — кладёт весь лог в буфер обмена.
+       5. Кнопка "ПЕРЕХВАТ" (F9-хук) — ловит исходящие FireServer/InvokeServer
+          из игры. ВКЛЮЧАЙ ОТДЕЛЬНО, может крашить — сначала лог без него.
+       6. RemoteFunction-ы не трогаются (OnClientInvoke нельзя прочитать,
+          а перезапись может сломать игру). Есть флаг HOOK_REMOTE_FUNCTIONS.
+
+     ГОРЯЧИЕ КЛАВИШИ:  F7 — очистить лог,  F8 — скопировать лог в буфер.
 
      КАК ПОЛЬЗОВАТЬСЯ:
-       - запустить, нажать "СБРОС" (очистить лог),
-       - поехать и сделать стант, во время которого роняет,
-       - после падения остановиться и нажать "КОПИРОВАТЬ",
+       - запустить (лучше БЕЗ анти-падения, оно маскирует момент срыва),
+       - нажать F7 (очистить лог),
+       - поехать и сделать стант, на котором роняет,
+       - после того как сдёрнуло — нажать F8 (копия в буфер),
        - прислать сюда лог (или строки из F9 с префиксом [DIAG]).
      ============================================================= ]]
 
@@ -207,14 +211,25 @@ local function watchCharacter(char)
 	local lastProp = {}
 	hum.Changed:Connect(function(prop)
 		if WATCH[prop] then
-			local now = val(hum[prop])
-			if lastProp[prop] == now then
+			local okRead, rawValue = pcall(function()
+				return hum[prop]
+			end)
+			if not okRead then
+				return
+			end
+			local prev = lastProp[prop]
+			local now = val(rawValue)
+			if prev == now then
 				return
 			end
 			lastProp[prop] = now
 			write("СВОЙСТВО", prop .. " = " .. now)
 			if prop == "PlatformStand" and hum.PlatformStand then
 				dumpSituation("кто-то поставил PlatformStand = true")
+			elseif prop == "Sit" and now == "false" and prev == "true" then
+				dumpSituation("выбросило из сиденья (Sit: true -> false)")
+			elseif prop == "SeatPart" and hum.SeatPart == nil then
+				dumpSituation("пропал SeatPart (сняли с самоката)")
 			end
 		end
 	end)
@@ -228,23 +243,42 @@ player.CharacterAdded:Connect(watchCharacter)
 --=============================================================
 -- ЧТО СЕРВЕР ПРИСЫЛАЕТ КЛИЕНТУ (главное!)
 --=============================================================
+-- ВНИМАНИЕ: OnClientInvoke у RemoteFunction нельзя прочитать (ошибка "get is not
+-- available"), а его перезапись может сломать игру, если игра сама отвечает на
+-- серверные вызовы. Поэтому RemoteFunction-ы по умолчанию НЕ трогаем.
+-- Поставь true только если понимаешь риск.
+local HOOK_REMOTE_FUNCTIONS = false
+
 local spied = {}
 local function spyRemote(r)
 	if spied[r] then
 		return
 	end
 	spied[r] = true
+
 	if r:IsA("RemoteEvent") or r.ClassName == "UnreliableRemoteEvent" then
-		r.OnClientEvent:Connect(function(...)
-			write("СЕРВЕР>КЛИЕНТ", r.Name .. argsStr(...))
+		local ok, err = pcall(function()
+			r.OnClientEvent:Connect(function(...)
+				write("СЕРВЕР>КЛИЕНТ", r.Name .. argsStr(...))
+			end)
 		end)
+		if not ok then
+			write("РЕМОУТ", "не смог подписаться на " .. r.Name .. ": " .. tostring(err))
+		end
 	elseif r:IsA("RemoteFunction") then
-		local old = r.OnClientInvoke
-		r.OnClientInvoke = function(...)
-			write("СЕРВЕР>КЛИЕНТ", r.Name .. ":Invoke" .. argsStr(...))
-			if old then
-				return old(...)
+		if HOOK_REMOTE_FUNCTIONS then
+			local ok, err = pcall(function()
+				r.OnClientInvoke = function(...)
+					write("СЕРВЕР>КЛИЕНТ", r.Name .. ":Invoke" .. argsStr(...))
+				end
+			end)
+			if ok then
+				write("РЕМОУТ", "RemoteFunction " .. r.Name .. " — перехвачен OnClientInvoke")
+			else
+				write("РЕМОУТ", "RemoteFunction " .. r.Name .. " — не удалось перехватить: " .. tostring(err))
 			end
+		else
+			write("РЕМОУТ", "RemoteFunction " .. r.Name .. " — пропущен (HOOK_REMOTE_FUNCTIONS = false)")
 		end
 	end
 end
@@ -315,7 +349,6 @@ end)
 --=============================================================
 -- WORKSPACE: самокат пропал / пересоздался / появилось новое
 --=============================================================
-local srvScripts = nil
 workspace.ChildAdded:Connect(function(c)
 	write("WORKSPACE+", c.ClassName .. " '" .. c.Name .. "'")
 	if c:IsA("Seat") then
