@@ -1,5 +1,5 @@
 --[[
-    ★ Anti-Looped Out v9: анти-падение + фарм + свои самокаты + серверный спавн ★
+    ★ Anti-Looped Out v9: анти-падение + фарм + свои самокаты + серверный спавн ★ 1
 
     СЕРВЕРНЫЙ СПАВН (чтобы видели ВСЕ игроки):
       Локальный клон видят только ты — это ограничение Roblox, обойти нельзя.
@@ -109,6 +109,7 @@ local cfg = {
 	rollLimit    = 14,     -- максимальный крен на бок в градусах
 	respeedEvery = 0.5,    -- [6]
 	debug        = true,
+	touchNothing = false,  -- безопасный режим: вообще ничего не трогаем, только пишем лог
 }
 
 local KEYWORDS = { "crash", "fall", "wipeout", "bail", "ragdoll", "looped" }
@@ -187,13 +188,22 @@ pcall(function()
 		if e.messageType == Enum.MessageType.MessageError then
 			noteGameError(e.message, true)
 		end
-	end
-	LogService.MessageOut:Connect(function(message, msgType)
-		if msgType == Enum.MessageType.MessageError then
-			noteGameError(message, false)
-		end
-	end)
+	end		LogService.MessageOut:Connect(function(message, msgType)
+			if msgType == Enum.MessageType.MessageError then
+				noteGameError(message, false)
+			end
+		end)
 end)
+
+-- БАННЕР: сразу видно, падала ли игра ЕЩЁ ДО нас.
+-- Если ошибка в истории помечена "(давняя)" — она не от нашего скрипта:
+-- в F9 она будет видна каждый раз, когда ты запускаешь скрипт, просто
+-- потому что F9 показывает весь лог сессии.
+if gameErrors.count > 0 then
+	log("=== ОШИБОК ИГРЫ ДО НАШЕГО ЗАПУСКА: " .. gameErrors.count .. " (это игра, а не скрипт) ===")
+else
+	log("=== до нашего запуска ошибок игры НЕ было — теперь видно, что добавили мы ===")
+end
 
 -- ================= СОСТОЯНИЕ =================
 local humanoid, root, character
@@ -273,6 +283,7 @@ end
 local blockedScripts = {}
 
 local function blockCrashScripts(silent)
+	if cfg.touchNothing then return 0 end
 	local ps = player:FindFirstChild("PlayerScripts")
 	if not ps then return 0 end
 	local count = 0
@@ -515,7 +526,7 @@ end)
 -- [5] АССИСТ: не перекрутить выше порога LOOPED OUT
 -- =========================================================
 local function assistStep()
-	if not (cfg.enabled and cfg.assist) then return end
+	if cfg.touchNothing or not (cfg.enabled and cfg.assist) then return end
 	-- работаем только когда едем/сидим, чтобы не крутить стоящий самокат
 	if not (isMounted() or getSpeed() > 3) then return end
 	local model = findScooterModel()
@@ -915,7 +926,7 @@ local function farmOn()
 end
 
 local function farmStep()
-	if not farm.on then return end
+	if cfg.touchNothing or not farm.on then return end
 
 	-- если калибровка не прошла (были не на самокате) — попробуем снова на ходу
 	if not farm.method and not calibrating and isMounted() then
@@ -958,7 +969,7 @@ screenGui.Parent = player:WaitForChild("PlayerGui")
 
 local frame = Instance.new("Frame")
 frame.Name = "MainFrame"
-frame.Size = UDim2.new(0, 270, 0, 400)
+frame.Size = UDim2.new(0, 270, 0, 432)
 frame.Position = UDim2.new(0, 20, 0, 90)
 frame.BackgroundColor3 = Color3.fromRGB(26, 26, 30)
 frame.BorderSizePixel = 0
@@ -1000,6 +1011,33 @@ local holdBtn   = makeButton("[4] Держать деку", 130, green)
 local assistBtn = makeButton("[5] Ассист (не перекрут)", 156, green)
 local resBtn    = makeButton("[6] Перепроверка", 182, red)
 local resetBtn  = makeButton("Сбросить счётчики", 208, Color3.fromRGB(80, 80, 95))
+local safeBtn   = makeButton("БЕЗОПАСНО: НЕ ТРОГАТЬ НИЧЕГО", 288, Color3.fromRGB(150, 90, 40))
+
+local function safeMode()
+	cfg.touchNothing = true
+	cfg.enabled = false
+	cfg.blockScripts = false
+	cfg.blockRemotes = false
+	cfg.noFall = false
+	cfg.holdDeck = false
+	cfg.assist = false
+	restoreCrashScripts()
+	farmOff("безопасный режим")
+	releaseHold("безопасный режим")
+	local m = (scooterModel and scooterModel.Parent) and scooterModel or findScooterModel()
+	if m then removeDrive(m) end
+	paint(masterBtn, false, "Защита")
+	paint(scriptBtn, false, "[1] Скрипты аварии")
+	paint(remoteBtn, false, "[2] Ремоуты аварии")
+	paint(noFallBtn, false, "[3] Не падать")
+	paint(holdBtn, false, "[4] Держать деку")
+	paint(assistBtn, false, "[5] Ассист (не перекрут)")
+	paint(farmBtn, false, "АВТО-ФАРМ ВИЛИ")
+	log("БЕЗОПАСНЫЙ РЕЖИМ: ничего больше не трогаем, только лог и ошибки")
+	log("перезапусти игру и посмотри: есть ли ошибка в списке ИГРА ОШИБКА с пометкой (давняя)")
+end
+
+safeBtn.MouseButton1Click:Connect(safeMode)
 local farmBtn   = makeButton("АВТО-ФАРМ ВИЛИ: ВЫКЛ", 234, red)
 local calibBtn  = makeButton("Найти клавишу вили", 260, Color3.fromRGB(60, 90, 150))
 
@@ -1428,6 +1466,7 @@ end
 
 -- руль своего самоката (скорость разгоняет общий механизм ниже)
 local function mySteerStep()
+	if cfg.touchNothing then return end
 	local clone = my.riding
 	if not (clone and clone.Parent) then
 		my.riding = nil
@@ -1454,6 +1493,7 @@ local speedInfo = { asked = 0, real = 0, mode = "-" }
 
 -- ГЛАВНОЕ: применяем скорость сразу тремя способами, чтобы игра её не съедала
 local function speedApplyStep(dt)
+	if cfg.touchNothing then return end
 	local target = tonumber(speedCtrl.target) or 50
 	speedInfo.asked = target
 
