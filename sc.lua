@@ -1,5 +1,17 @@
 --[[
-    ★ Anti-Looped Out v7 + АВТО-ФАРМ ВИЛИ ★   (без хуков метатаблиц)
+    ★ Anti-Looped Out v8: анти-падение + авто-фарм + свои самокаты ★
+
+    ОКНО "САМИКИ" (справа):
+      * список моделей из ReplicatedStorage.Scooters — что нашлось, то в списке;
+      * "Спавнить рядом со мной" — клон выбранной модели перед тобой, на землю;
+      * "Сесть на мой" — ставит тебя на деку своего самоката (держит слой [4]);
+        газ — W, назад — S, руль — A/D, слезть — C;
+      * "Удалить мой" — убирает все твои клоны;
+      * "Скорость: x1/x2/x3/x5/x8" — крутилка. На игровом самокате держит
+        скорость до xN от базовых ~50 студ/с (потолок 320), на своём — задаёт
+        скорость движения.
+      Честно: клон клиента видит только ты. Сервер про него не знает, поэтому
+      игра сама на него не посадит — сажаемся кнопкой, и держит наш слой [4].
 
     АВТО-ФАРМ (кнопка справа снизу):
       Игра платит за вили (в логе WheelieReward + CashGain), поэтому фарм =
@@ -113,6 +125,7 @@ local assistClamps = 0
 local lastAssist   = 0
 local lastAngle    = "-"
 local releaseGraceUntil = 0
+local holdForever  = false      -- держим райдера бесконечно (езда на своём самокате)
 
 local function getSpeed()
 	if root and root.Parent then
@@ -234,6 +247,7 @@ end
 local function releaseHold(reason)
 	if not holdActive then return end
 	holdActive = false
+	holdForever = false
 	holdUntil = 0
 
 	-- мягкий выход: не бросаем сразу (иначе можно слететь снова)
@@ -273,6 +287,7 @@ local function startHold(speed, reason)
 	end
 	crashCount += 1
 	holdActive = true
+	holdForever = false
 	holdUntil = os.clock() + cfg.holdSeconds
 	lastCrash = string.format("срыв #%d: %.0f студ/с (%s)", crashCount, speed, tostring(reason))
 	log(string.format("СРЫВ #%d на %.0f -> держу деку до %.1f сек", crashCount, speed, cfg.holdSeconds))
@@ -527,6 +542,8 @@ RunService.Stepped:Connect(function()
 			releaseHold("время вышло")
 		elseif mountByEvent then
 			releaseHold("игра снова посадила")
+		elseif holdForever then
+			-- едем на своём самокате: держим, пока сами не отпустим (C)
 		else
 			-- отпускаем, если самокат встал ровно и остановился
 			local model = findScooterModel()
@@ -863,7 +880,7 @@ Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 8)
 local title = Instance.new("TextLabel")
 title.Size = UDim2.new(1, 0, 0, 24)
 title.BackgroundTransparency = 1
-title.Text = "★ Anti-Looped Out v7 + ФАРМ ★"
+title.Text = "★ Anti-Looped Out v8 ★"
 title.TextColor3 = Color3.fromRGB(255, 255, 255)
 title.TextSize = 13
 title.Font = Enum.Font.SourceSansBold
@@ -1074,4 +1091,396 @@ if cfg.blockScripts and cfg.enabled then
 	end)
 end
 
-log("v6 запущен. C — отпустить деку вручную.")
+log("v8 запущен. C — отпустить деку вручную.")
+
+-- =========================================================
+-- [8] САМИКИ: скорость + спавн из ReplicatedStorage.Scooters
+--
+--     ВАЖНО, честно: всё, что создаёт клиент, видит только он сам.
+--     Для сервера твоего самоката не существует, поэтому игра сама на него
+--     не посадит. Зато он полностью клиентский — клиент владеет его физикой,
+--     и кнопка "Сесть на мой" ставит тебя на деку, а слой [4] удерживает.
+--     Газ (W), назад (S) и руль (A/D) для своего самоката сделаны ниже.
+-- =========================================================
+local SCOOTERS_FOLDER = "Scooters"
+local SPEED_STEPS = { 1, 2, 3, 5, 8 }
+local MAX_SPEED = 320
+
+local my = {
+	templates = {},
+	selected = nil,
+	clones = {},
+	speedIdx = 1,
+	riding = nil,
+	baseSpeed = 50,     -- в логе игра писала ScooterPredictedSpeed ≈ 49
+}
+
+-- самое крупное основание модели = её "двигатель" для физики
+local function primaryOf(model)
+	if not model then return nil end
+	local p = model.PrimaryPart
+	if p and p:IsA("BasePart") then return p end
+	local best, bestVol = nil, 0
+	for _, d in ipairs(model:GetDescendants()) do
+		if d:IsA("BasePart") then
+			local v = d.Size.X * d.Size.Y * d.Size.Z
+			if v > bestVol then
+				bestVol, best = v, d
+			end
+		end
+	end
+	return best
+end
+
+local function refreshTemplates()
+	my.templates = {}
+	local folder = ReplicatedStorage:FindFirstChild(SCOOTERS_FOLDER)
+	if not folder then
+		log("ReplicatedStorage." .. SCOOTERS_FOLDER .. " не найдена")
+		return
+	end
+	for _, d in ipairs(folder:GetDescendants()) do
+		if d:IsA("Model") then
+			table.insert(my.templates, d)
+		end
+	end
+	if #my.templates == 0 then
+		for _, d in ipairs(folder:GetChildren()) do
+			if d:IsA("Model") or d:IsA("Tool") then
+				table.insert(my.templates, d)
+			end
+		end
+	end
+	log("моделей самокатов в ReplicatedStorage." .. SCOOTERS_FOLDER .. ": " .. #my.templates)
+end
+
+local function prepareClone(clone)
+	for _, d in ipairs(clone:GetDescendants()) do
+		if d:IsA("BasePart") then
+			pcall(function()
+				d.Anchored = false
+				d.CanCollide = true
+				d.CanQuery = true
+				d.CanTouch = true
+				d.Massless = false
+			end)
+		elseif d:IsA("BaseScript") then
+			pcall(function() d.Disabled = true end)
+		end
+	end
+end
+
+local function placeNearMe(model)
+	if not (character and root and root.Parent) then return end
+	local front = root.CFrame * CFrame.new(0, 0, -9)
+	local rp = RaycastParams.new()
+	rp.FilterType = Enum.RaycastFilterType.Exclude
+	rp.FilterDescendantsInstances = { character, model }
+	local hit = workspace:Raycast(front.Position + Vector3.new(0, 20, 0), Vector3.new(0, -80, 0), rp)
+	local y = hit and hit.Position.Y or front.Position.Y
+	local rot = front - front.Position
+	model:PivotTo(CFrame.new(Vector3.new(front.Position.X, y, front.Position.Z)) * rot)
+	local ok, size = pcall(function()
+		local _, s = model:GetBoundingBox()
+		return s
+	end)
+	if ok and size then
+		local cf = model:GetPivot()
+		model:PivotTo(cf + Vector3.new(0, size.Y / 2, 0))
+	end
+end
+
+local function spawnNear()
+	if not my.selected then
+		log("спавн: сначала выбери модель в списке (окно САМИКИ)")
+		return
+	end
+	local ok, clone = pcall(function() return my.selected:Clone() end)
+	if not ok or not clone then
+		log("спавн: не удалось склонировать " .. my.selected.Name)
+		return
+	end
+	clone.Name = "MY_" .. my.selected.Name
+	prepareClone(clone)
+	if not clone.PrimaryPart then
+		clone.PrimaryPart = primaryOf(clone)
+	end
+	clone.Parent = workspace
+	my.clones[clone] = true
+	placeNearMe(clone)
+	log("заспавнил рядом: " .. clone.Name)
+end
+
+local function deleteMine()
+	for m in pairs(my.clones) do
+		pcall(function()
+			if m and m.Parent then m:Destroy() end
+		end)
+	end
+	my.clones = {}
+	if my.riding then
+		my.riding = nil
+		if holdActive then releaseHold("свой самокат удалён") end
+	end
+	log("мои самокаты удалены")
+end
+
+local function rideMine()
+	local clone
+	for m in pairs(my.clones) do
+		if m and m.Parent then
+			clone = m
+			break
+		end
+	end
+	if not clone then
+		log("сесть: сначала нажми Спавнить рядом")
+		return
+	end
+	if not (character and root and root.Parent) then return end
+
+	local pivot = clone:GetPivot()
+	local size
+	pcall(function()
+		local _, s = clone:GetBoundingBox()
+		size = s
+	end)
+	local h = (size and size.Y / 2) or 2
+	local rot = pivot - pivot.Position
+	local deck = CFrame.new(pivot.Position + Vector3.new(0, h + 2.5, 0)) * rot
+
+	pcall(function() character:PivotTo(deck) end)
+	if humanoid and humanoid.Parent then
+		pcall(function() humanoid.PlatformStand = true end)
+		pcall(function() humanoid:ChangeState(Enum.HumanoidStateType.PlatformStanding) end)
+	end
+
+	my.riding = clone
+	scooterModel = clone
+	deckRel = pivot:ToObjectSpace(deck)
+	local ok, w = pcall(function() return clone:GetPivot() * deckRel end)
+	if ok then deckWorld = w end
+	holdActive = true
+	holdForever = true
+	holdUntil = math.huge
+	log("сел на свой самокат: " .. clone.Name .. " (газ W, назад S, руль A/D, C — слезть)")
+end
+
+-- газ/руль для своего самоката
+local function myDriveStep()
+	local clone = my.riding
+	if not (clone and clone.Parent) then
+		my.riding = nil
+		return
+	end
+	-- слезли (C или слой отпустили) — больше не ведём самокат
+	if not holdActive then
+		my.riding = nil
+		scooterModel = nil
+		return
+	end
+	local part = primaryOf(clone)
+	if not part then return end
+
+	local speed = my.baseSpeed * SPEED_STEPS[my.speedIdx]
+	local look = clone:GetPivot().LookVector
+	local flat = Vector3.new(look.X, 0, look.Z)
+	if flat.Magnitude < 0.001 then return end
+	flat = flat.Unit
+
+	local fwd = UserInputService:IsKeyDown(Enum.KeyCode.W)
+	local back = UserInputService:IsKeyDown(Enum.KeyCode.S)
+	local steer = 0
+	if UserInputService:IsKeyDown(Enum.KeyCode.A) then steer += 1 end
+	if UserInputService:IsKeyDown(Enum.KeyCode.D) then steer -= 1 end
+
+	if fwd or back then
+		local dir = fwd and flat or -flat
+		pcall(function()
+			part.AssemblyLinearVelocity = Vector3.new(dir.X * speed, part.AssemblyLinearVelocity.Y, dir.Z * speed)
+		end)
+	end
+	if steer ~= 0 then
+		pcall(function()
+			clone:PivotTo(clone:GetPivot() * CFrame.Angles(0, math.rad(steer * 2.2), 0))
+		end)
+	end
+end
+
+-- накрутка скорости на ИГРОВОМ самокате (не экспоненциально: держим скорость до потолка)
+local function speedBoostStep()
+	local mult = SPEED_STEPS[my.speedIdx]
+	if mult <= 1 then return end
+	if my.riding then return end
+	local model = (scooterModel and scooterModel.Parent) and scooterModel or findScooterModel()
+	if not model then return end
+	local part = primaryOf(model)
+	if not part then return end
+	local v = part.AssemblyLinearVelocity
+	local flat = Vector3.new(v.X, 0, v.Z)
+	if flat.Magnitude < 3 then return end
+	local cap = math.min(my.baseSpeed * mult, MAX_SPEED)
+	if flat.Magnitude >= cap then return end
+	local dir = flat.Unit
+	pcall(function()
+		part.AssemblyLinearVelocity = Vector3.new(dir.X * cap, v.Y, dir.Z * cap)
+	end)
+end
+
+RunService.RenderStepped:Connect(function()
+	myDriveStep()
+	speedBoostStep()
+end)
+
+-- ===================== ОКНО "САМИКИ" =====================
+local gui2 = Instance.new("ScreenGui")
+gui2.Name = "MyScooterGui"
+gui2.ResetOnSpawn = false
+gui2.Parent = player:WaitForChild("PlayerGui")
+
+local f2 = Instance.new("Frame")
+f2.Size = UDim2.new(0, 260, 0, 330)
+f2.Position = UDim2.new(1, -285, 0, 90)
+f2.BackgroundColor3 = Color3.fromRGB(24, 26, 32)
+f2.BorderSizePixel = 0
+f2.Active = true
+f2.Parent = gui2
+Instance.new("UICorner", f2).CornerRadius = UDim.new(0, 8)
+
+local t2 = Instance.new("TextLabel")
+t2.Size = UDim2.new(1, 0, 0, 24)
+t2.BackgroundTransparency = 1
+t2.Text = "★ САМИКИ (ReplicatedStorage.Scooters) ★"
+t2.TextColor3 = Color3.fromRGB(255, 230, 150)
+t2.TextSize = 12
+t2.Font = Enum.Font.SourceSansBold
+t2.Parent = f2
+
+local list = Instance.new("ScrollingFrame")
+list.Size = UDim2.new(0.95, 0, 0, 150)
+list.Position = UDim2.new(0.025, 0, 0, 26)
+list.BackgroundColor3 = Color3.fromRGB(14, 14, 18)
+list.BorderSizePixel = 0
+list.CanvasSize = UDim2.new(0, 0, 0, 0)
+list.AutomaticCanvasSize = Enum.AutomaticSize.Y
+list.ScrollBarThickness = 4
+list.Parent = f2
+local layout = Instance.new("UIListLayout")
+layout.Padding = UDim.new(0, 3)
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Parent = list
+
+local pickLabel = Instance.new("TextLabel")
+pickLabel.Size = UDim2.new(0.95, 0, 0, 18)
+pickLabel.Position = UDim2.new(0.025, 0, 0, 180)
+pickLabel.BackgroundTransparency = 1
+pickLabel.Text = "выбрано: -"
+pickLabel.TextColor3 = Color3.fromRGB(200, 210, 220)
+pickLabel.TextSize = 11
+pickLabel.Font = Enum.Font.Code
+pickLabel.TextXAlignment = Enum.TextXAlignment.Left
+pickLabel.Parent = f2
+
+local function makeBtn2(text, y, color)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(0.95, 0, 0, 24)
+	b.Position = UDim2.new(0.025, 0, 0, y)
+	b.BackgroundColor3 = color
+	b.Text = text
+	b.TextColor3 = Color3.fromRGB(255, 255, 255)
+	b.TextSize = 12
+	b.Font = Enum.Font.SourceSans
+	b.Parent = f2
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 6)
+	return b
+end
+
+local itemButtons = {}
+local function paintList()
+	for m, b in pairs(itemButtons) do
+		if m == my.selected then
+			b.BackgroundColor3 = Color3.fromRGB(60, 140, 90)
+		else
+			b.BackgroundColor3 = Color3.fromRGB(50, 50, 62)
+		end
+	end
+	pickLabel.Text = "выбрано: " .. (my.selected and my.selected.Name or "-")
+end
+
+local function buildList()
+	for _, b in pairs(itemButtons) do
+		b:Destroy()
+	end
+	itemButtons = {}
+	for i, m in ipairs(my.templates) do
+		local b = Instance.new("TextButton")
+		b.Size = UDim2.new(1, -6, 0, 22)
+		b.BackgroundColor3 = Color3.fromRGB(50, 50, 62)
+		b.Text = m.Name
+		b.TextColor3 = Color3.fromRGB(255, 255, 255)
+		b.TextSize = 11
+		b.Font = Enum.Font.SourceSans
+		b.LayoutOrder = i
+		b.Parent = list
+		Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+		b.MouseButton1Click:Connect(function()
+			my.selected = m
+			paintList()
+			log("выбран самокат: " .. m.Name)
+		end)
+		itemButtons[m] = b
+	end
+	paintList()
+end
+
+local btnSpawn = makeBtn2("Спавнить рядом со мной", 202, Color3.fromRGB(60, 120, 190))
+local btnRide  = makeBtn2("Сесть на мой", 228, Color3.fromRGB(60, 170, 90))
+local btnDel   = makeBtn2("Удалить мой", 254, Color3.fromRGB(160, 70, 70))
+local btnSpeed = makeBtn2("Скорость: x1", 280, Color3.fromRGB(140, 110, 50))
+
+btnSpawn.MouseButton1Click:Connect(spawnNear)
+btnRide.MouseButton1Click:Connect(rideMine)
+btnDel.MouseButton1Click:Connect(deleteMine)
+btnSpeed.MouseButton1Click:Connect(function()
+	my.speedIdx = (my.speedIdx % #SPEED_STEPS) + 1
+	btnSpeed.Text = "Скорость: x" .. SPEED_STEPS[my.speedIdx]
+	log("скорость самоката: x" .. SPEED_STEPS[my.speedIdx]
+		.. (my.riding and " (мой)" or " (игровой)"))
+end)
+
+-- перетаскивание второго окна
+local function makeDraggable(gf)
+	local dragging, dragStart, startPos, dragInput
+	gf.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseButton1
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = gf.Position
+			input.Changed:Connect(function()
+				if input.UserInputState == Enum.UserInputState.End then
+					dragging = false
+				end
+			end)
+		end
+	end)
+	gf.InputChanged:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.MouseMovement
+			or input.UserInputType == Enum.UserInputType.Touch then
+			dragInput = input
+		end
+	end)
+	UserInputService.InputChanged:Connect(function(input)
+		if input == dragInput and dragging then
+			local delta = input.Position - dragStart
+			gf.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + delta.X,
+				startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+		end
+	end)
+end
+makeDraggable(f2)
+
+refreshTemplates()
+buildList()
+log("окно САМИКИ готово. Выбери модель -> Спавнить рядом -> Сесть на мой, газ W.")
