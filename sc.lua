@@ -1287,40 +1287,83 @@ local function rideMine()
 	log("сел на свой самокат: " .. clone.Name .. " (газ W, назад S, руль A/D, C — слезть)")
 end
 
--- газ/руль для своего самоката
-local function myDriveStep()
+local function ownerOf(model)
+	for _, p in ipairs(model:GetDescendants()) do
+		if p:IsA("BasePart") then
+			local ok, owner = pcall(function() return p:GetNetworkOwner() end)
+			if ok then
+				return owner and owner.Name or "сервер"
+			end
+		end
+	end
+	return "?"
+end
+
+-- у модели может быть несколько отдельных сборок (корпус, колёса) — берём корни всех
+local function assemblyRootsOf(model)
+	local seen, res = {}, {}
+	for _, p in ipairs(model:GetDescendants()) do
+		if p:IsA("BasePart") and not p.Anchored then
+			local ok, root = pcall(function() return p.AssemblyRootPart end)
+			if ok and root and not seen[root] then
+				seen[root] = true
+				res[#res + 1] = root
+			end
+		end
+	end
+	return res
+end
+
+local function ensureDrive(part)
+	local att = part:FindFirstChild("AF_Drive")
+	if not att then
+		att = Instance.new("Attachment")
+		att.Name = "AF_Drive"
+		att.Parent = part
+	end
+	local lv = att:FindFirstChild("AF_DriveLV")
+	if not lv then
+		lv = Instance.new("LinearVelocity")
+		lv.Name = "AF_DriveLV"
+		lv.Attachment0 = att
+		lv.Parent = att
+		pcall(function()
+			lv.VelocityConstraintMode = Enum.VelocityConstraintMode.Vector
+			lv.RelativeTo = Enum.ActuatorRelativeTo.World
+			lv.ForceLimitsEnabled = true
+		end)
+	end
+	return lv
+end
+
+local function removeDrive(model)
+	for _, p in ipairs(model:GetDescendants()) do
+		local att = p.FindFirstChild and p:FindFirstChild("AF_Drive")
+		if att then
+			local lv = att:FindFirstChild("AF_DriveLV")
+			if lv then pcall(function() lv:Destroy() end) end
+			pcall(function() att:Destroy() end)
+		end
+	end
+end
+
+-- руль своего самоката (скорость разгоняет общий механизм ниже)
+local function mySteerStep()
 	local clone = my.riding
 	if not (clone and clone.Parent) then
 		my.riding = nil
 		return
 	end
-	-- слезли (C или слой отпустили) — больше не ведём самокат
+	-- слезли (C или слой отпустил) — больше не ведём самокат
 	if not holdActive then
 		my.riding = nil
 		scooterModel = nil
 		return
 	end
-	local part = primaryOf(clone)
-	if not part then return end
-
-	local speed = my.baseSpeed * SPEED_STEPS[my.speedIdx]
-	local look = clone:GetPivot().LookVector
-	local flat = Vector3.new(look.X, 0, look.Z)
-	if flat.Magnitude < 0.001 then return end
-	flat = flat.Unit
-
-	local fwd = UserInputService:IsKeyDown(Enum.KeyCode.W)
-	local back = UserInputService:IsKeyDown(Enum.KeyCode.S)
 	local steer = 0
 	if UserInputService:IsKeyDown(Enum.KeyCode.A) then steer += 1 end
 	if UserInputService:IsKeyDown(Enum.KeyCode.D) then steer -= 1 end
 
-	if fwd or back then
-		local dir = fwd and flat or -flat
-		pcall(function()
-			part.AssemblyLinearVelocity = Vector3.new(dir.X * speed, part.AssemblyLinearVelocity.Y, dir.Z * speed)
-		end)
-	end
 	if steer ~= 0 then
 		pcall(function()
 			clone:PivotTo(clone:GetPivot() * CFrame.Angles(0, math.rad(steer * 2.2), 0))
@@ -1328,29 +1371,95 @@ local function myDriveStep()
 	end
 end
 
--- накрутка скорости на ИГРОВОМ самокате (не экспоненциально: держим скорость до потолка)
-local function speedBoostStep()
-	local mult = SPEED_STEPS[my.speedIdx]
-	if mult <= 1 then return end
-	if my.riding then return end
-	local model = (scooterModel and scooterModel.Parent) and scooterModel or findScooterModel()
-	if not model then return end
-	local part = primaryOf(model)
-	if not part then return end
-	local v = part.AssemblyLinearVelocity
-	local flat = Vector3.new(v.X, 0, v.Z)
-	if flat.Magnitude < 3 then return end
-	local cap = math.min(my.baseSpeed * mult, MAX_SPEED)
-	if flat.Magnitude >= cap then return end
-	local dir = flat.Unit
-	pcall(function()
-		part.AssemblyLinearVelocity = Vector3.new(dir.X * cap, v.Y, dir.Z * cap)
-	end)
+local speedInfo = { asked = 0, real = 0, mode = "-" }
+
+-- ГЛАВНОЕ: применяем скорость сразу тремя способами, чтобы игра её не съедала
+local function speedApplyStep(dt)
+	local target = tonumber(speedCtrl.target) or 50
+	speedInfo.asked = target
+
+	local model = (my.riding and my.riding.Parent) and my.riding
+		or ((scooterModel and scooterModel.Parent) and scooterModel)
+		or findScooterModel()
+	if not model then
+		speedInfo.real = 0
+		return
+	end
+	if not (isMounted() or my.riding) then return end
+
+	local pivot = model:GetPivot()
+	local look = pivot.LookVector
+	local flatLook = Vector3.new(look.X, 0, look.Z)
+	if flatLook.Magnitude < 0.001 then return end
+	flatLook = flatLook.Unit
+
+	local roots = assemblyRootsOf(model)
+	if #roots == 0 then return end
+
+	local fwd = UserInputService:IsKeyDown(Enum.KeyCode.W)
+	local back = UserInputService:IsKeyDown(Enum.KeyCode.S)
+
+	local v0 = roots[1].AssemblyLinearVelocity
+	local flatV = Vector3.new(v0.X, 0, v0.Z)
+	speedInfo.real = flatV.Magnitude
+
+	local dir
+	if flatV.Magnitude > 2 then
+		dir = flatV.Unit
+	elseif fwd or back then
+		dir = fwd and flatLook or -flatLook
+	elseif speedCtrl.autoDrive then
+		dir = flatLook
+	end
+
+	if not dir then
+		for _, part in ipairs(roots) do
+			local lv = ensureDrive(part)
+			if lv then lv.Enabled = false end
+		end
+		speedInfo.mode = "стоим"
+		return
+	end
+
+	local want = target
+	if back and not fwd then want = -target end
+
+	-- способ 1: линейная тяга (тянет каждый физический шаг — скорость не спадает)
+	if speedCtrl.useLinear then
+		for _, part in ipairs(roots) do
+			local lv = ensureDrive(part)
+			if lv then
+				lv.Enabled = true
+				lv.MaxForce = speedCtrl.maxForce
+				lv.VectorVelocity = dir * want
+			end
+		end
+	end
+
+	-- способ 2: напрямую задать скорость всем сборкам
+	for _, part in ipairs(roots) do
+		pcall(function()
+			part.AssemblyLinearVelocity = Vector3.new(dir.X * want, part.AssemblyLinearVelocity.Y, dir.Z * want)
+		end)
+	end
+
+	-- способ 3: жёстко двигать модель (работает там, где физику игры не переспорить)
+	if speedCtrl.hardMode and dt then
+		local owner = ownerOf(model)
+		local allowed = (my.riding ~= nil) or owner == player.Name
+		if allowed then
+			pcall(function()
+				model:PivotTo(CFrame.new(pivot.Position + dir * want * dt) * (pivot - pivot.Position))
+			end)
+		end
+	end
+
+	speedInfo.mode = (speedCtrl.useLinear and "тяга" or "") .. (speedCtrl.hardMode and "+жёстко" or "")
 end
 
-RunService.RenderStepped:Connect(function()
-	myDriveStep()
-	speedBoostStep()
+RunService.RenderStepped:Connect(function(dt)
+	mySteerStep()
+	speedApplyStep(dt)
 end)
 
 -- ===================== ОКНО "САМИКИ" =====================
@@ -1916,6 +2025,156 @@ btnStopP.MouseButton1Click:Connect(function()
 	capture.logging = false
 	log("остановлено вручную")
 end)
+
+-- =========================================================
+-- [10] ОКНО "СКОРОСТЬ": любое число, применяется тремя способами
+--   игра перезаписывает физику каждый кадр, поэтому делаем разом:
+--     1) LinearVelocity (тяга) — держит скорость на каждом физшаге;
+--     2) AssemblyLinearVelocity — прямое задание скорости всем сборкам;
+--     3) жёсткий режим — каждый кадр двигаем саму модель.
+-- =========================================================
+local gui3 = Instance.new("ScreenGui")
+gui3.Name = "SpeedGui"
+gui3.ResetOnSpawn = false
+gui3.Parent = player:WaitForChild("PlayerGui")
+
+local f3 = Instance.new("Frame")
+f3.Size = UDim2.new(0, 235, 0, 205)
+f3.Position = UDim2.new(0, 20, 0, 440)
+f3.BackgroundColor3 = Color3.fromRGB(28, 24, 32)
+f3.BorderSizePixel = 0
+f3.Active = true
+f3.Parent = gui3
+Instance.new("UICorner", f3).CornerRadius = UDim.new(0, 8)
+
+local t3 = Instance.new("TextLabel")
+t3.Size = UDim2.new(1, 0, 0, 22)
+t3.BackgroundTransparency = 1
+t3.Text = "★ СКОРОСТЬ (любое число) ★"
+t3.TextColor3 = Color3.fromRGB(255, 220, 160)
+t3.TextSize = 12
+t3.Font = Enum.Font.SourceSansBold
+t3.Parent = f3
+
+local box = Instance.new("TextBox")
+box.Size = UDim2.new(0.54, 0, 0, 24)
+box.Position = UDim2.new(0.04, 0, 0, 24)
+box.BackgroundColor3 = Color3.fromRGB(15, 15, 18)
+box.TextColor3 = Color3.fromRGB(255, 255, 255)
+box.TextSize = 12
+box.Font = Enum.Font.Code
+box.Text = "300"
+box.ClearTextOnFocus = false
+box.Parent = f3
+Instance.new("UICorner", box).CornerRadius = UDim.new(0, 6)
+
+local applyB = Instance.new("TextButton")
+applyB.Size = UDim2.new(0.36, 0, 0, 24)
+applyB.Position = UDim2.new(0.6, 0, 0, 24)
+applyB.BackgroundColor3 = Color3.fromRGB(60, 120, 190)
+applyB.Text = "Применить"
+applyB.TextColor3 = Color3.fromRGB(255, 255, 255)
+applyB.TextSize = 12
+applyB.Parent = f3
+Instance.new("UICorner", applyB).CornerRadius = UDim.new(0, 6)
+
+local function applyBox()
+	local v = tonumber(box.Text)
+	if not v then
+		box.Text = tostring(speedCtrl.target)
+		log("скорость: это не число")
+		return
+	end
+	if v < 0 then v = 0 end
+	if v > MAX_SPEED then v = MAX_SPEED end
+	speedCtrl.target = v
+	box.Text = tostring(v)
+	log("скорость поставлена: " .. tostring(v) .. " студ/с")
+end
+applyB.MouseButton1Click:Connect(applyBox)
+box.FocusLost:Connect(applyBox)
+
+local function mkb(text, x, y, w, color, onClick)
+	local b = Instance.new("TextButton")
+	b.Size = UDim2.new(w, 0, 0, 22)
+	b.Position = UDim2.new(x, 0, 0, y)
+	b.BackgroundColor3 = color
+	b.Text = text
+	b.TextColor3 = Color3.fromRGB(255, 255, 255)
+	b.TextSize = 11
+	b.Font = Enum.Font.SourceSans
+	b.Parent = f3
+	Instance.new("UICorner", b).CornerRadius = UDim.new(0, 5)
+	if onClick then b.MouseButton1Click:Connect(onClick) end
+	return b
+end
+
+local green3 = Color3.fromRGB(50, 180, 80)
+local red3 = Color3.fromRGB(180, 60, 60)
+
+local bLin = mkb("Тяга: ВКЛ", 0.04, 54, 0.44, green3, function()
+	speedCtrl.useLinear = not speedCtrl.useLinear
+	bLin.Text = "Тяга: " .. (speedCtrl.useLinear and "ВКЛ" or "ВЫКЛ")
+	bLin.BackgroundColor3 = speedCtrl.useLinear and green3 or red3
+end)
+
+local bHard = mkb("Жёстко: ВКЛ", 0.52, 54, 0.44, green3, function()
+	speedCtrl.hardMode = not speedCtrl.hardMode
+	bHard.Text = "Жёстко: " .. (speedCtrl.hardMode and "ВКЛ" or "ВЫКЛ")
+	bHard.BackgroundColor3 = speedCtrl.hardMode and green3 or red3
+end)
+
+local bAuto = mkb("Авто-газ: ВЫКЛ", 0.04, 80, 0.44, red3, function()
+	speedCtrl.autoDrive = not speedCtrl.autoDrive
+	bAuto.Text = "Авто-газ: " .. (speedCtrl.autoDrive and "ВКЛ" or "ВЫКЛ")
+	bAuto.BackgroundColor3 = speedCtrl.autoDrive and green3 or red3
+end)
+
+local bClr = mkb("Снять тягу", 0.52, 80, 0.44, Color3.fromRGB(120, 90, 60), function()
+	local model = (my.riding and my.riding.Parent) and my.riding or findScooterModel()
+	if model then
+		removeDrive(model)
+		log("тяга снята с " .. model.Name)
+	end
+end)
+
+local mults = { 1, 2, 5, 10 }
+for i, mult in ipairs(mults) do
+	mkb("x" .. mult, 0.04 + (i - 1) * 0.24, 106, 0.2, Color3.fromRGB(70, 70, 90), function()
+		speedCtrl.target = my.baseSpeed * mult
+		box.Text = tostring(speedCtrl.target)
+		log("скорость x" .. mult .. " = " .. tostring(speedCtrl.target))
+	end)
+end
+
+local st3 = Instance.new("TextLabel")
+st3.Size = UDim2.new(0.92, 0, 0, 40)
+st3.Position = UDim2.new(0.04, 0, 0, 134)
+st3.BackgroundTransparency = 1
+st3.TextColor3 = Color3.fromRGB(215, 220, 225)
+st3.TextSize = 11
+st3.Font = Enum.Font.Code
+st3.TextXAlignment = Enum.TextXAlignment.Left
+st3.TextYAlignment = Enum.TextYAlignment.Top
+st3.TextWrapped = true
+st3.Text = ""
+st3.Parent = f3
+
+task.spawn(function()
+	while true do
+		local model = (my.riding and my.riding.Parent) and my.riding
+			or ((scooterModel and scooterModel.Parent) and scooterModel)
+			or findScooterModel()
+		st3.Text = string.format("цель: %d | сейчас: %d\nметод: %s\nвладелец: %s",
+			speedInfo.asked, speedInfo.real, tostring(speedInfo.mode),
+			model and ownerOf(model) or "-")
+		task.wait(0.25)
+	end
+end)
+
+makeDraggable(f3)
+log("окно СКОРОСТЬ готово: впиши любое число (например 300 или 1500) и жми Применить")
+log("если скорость всё равно падает — включи Авто-газ и проверь владельца в окне")
 
 log("готово: Призвать самокат | Повторить вызов | Лог ремоутов 20с | Проба SpawnScooter")
 log("подсказка: сетевой владелец виден в логе призыва — если владелец ты, движение самоката уходит на сервер и его видят все")
